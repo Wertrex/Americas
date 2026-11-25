@@ -207,4 +207,4 @@ Never paste code from either project into a pull request, an issue, a commit mes
 part of the repository history. If a contribution was written while looking at incompatible source, say so in the
 pull request so the provenance can be checked.
 
-Other dependencies keep their own licences; see the Credits and License sections of [README.md](../README.md).
+Other dependencies keep their own licences; see the Credits and License sections of [UPSTREAM_README.md](UPSTREAM_README.md).
