@@ -11488,6 +11488,7 @@ public:
         address.buffer = arena.buffer;
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
+        leonida::fault_heap_base().store(arena.address, std::memory_order_relaxed);
         // The GPU address arena is the console's address space: the title names it by offset, so the label path
         // has to find it (src/gpu_label_memory.h). Its address space starts at 0.
         if (arena.mapped)

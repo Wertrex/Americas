@@ -1,6 +1,9 @@
 #pragma once
 
 #include <vulkan/vulkan.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -20,6 +23,13 @@
 #include <vector>
 
 namespace leonida {
+
+// The GPU address arena's device address, set by the D3D12 layer, so a faulting address can be read back as the
+// console VA a translated shader computed (heap_base + VA).
+inline std::atomic<std::uint64_t>& fault_heap_base() {
+    static std::atomic<std::uint64_t> base{0};
+    return base;
+}
 
 struct DeviceFaultExtensions {
     bool fault = false;
@@ -411,6 +421,20 @@ private:
             std::fprintf(stderr, "[rt] device-fault: address[%zu] type=%d address=0x%" PRIx64
                                  " precision=%" PRIu64 "\n",
                          i, int(address.addressType), address.reportedAddress, address.addressPrecision);
+#ifdef _WIN32
+            // An invalid read or write: is heap_base + VA, VA being a console VA, memory the title really has?
+            const std::uint64_t heap = fault_heap_base().load(std::memory_order_relaxed);
+            if (heap && (address.addressType == VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT ||
+                         address.addressType == VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT)) {
+                const std::uint64_t va = address.reportedAddress - heap;
+                MEMORY_BASIC_INFORMATION info{};
+                const SIZE_T n = VirtualQuery(reinterpret_cast<const void*>(va), &info, sizeof(info));
+                std::fprintf(stderr, "[rt] device-fault: address[%zu] minus heap_base 0x%" PRIx64 " = title VA 0x%" PRIx64
+                                     ": %s base=%p region=0x%zx state=0x%lx protect=0x%lx type=0x%lx\n",
+                             i, heap, va, n ? "queried" : "VirtualQuery failed", info.BaseAddress, info.RegionSize,
+                             info.State, info.Protect, info.Type);
+            }
+#endif
         }
         for (std::size_t i = 0; i < counts.vendorInfoCount; ++i) {
             const auto& vendor = vendors[i];
