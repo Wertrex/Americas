@@ -40,6 +40,10 @@ struct Totals {
     std::atomic<std::int64_t> last_log{0};
     std::atomic<std::uint64_t> presents{0};  // frames the presenter showed (VulkanPresenter), since the last line
     std::atomic<std::uint64_t> present_serial{0};  // the same, never reset (LEONIDA_REFRESH_PER_FRAME)
+    // Threads whose innermost Scope is this phase now, and when the first of them entered it (steady_clock). Counted
+    // per phase, since queues submit from several threads: one value would go stale when their scopes overlap.
+    std::atomic<unsigned> active[kCount]{};
+    std::atomic<std::int64_t> active_since[kCount]{};
     std::atomic<std::uint32_t> thread{0};  // the thread of the last submission (the thread sampler reports it apart)
 };
 inline Totals& totals() {
@@ -86,11 +90,47 @@ inline void add(Phase p, std::uint64_t ns) {
 struct Scope {
     Phase phase;
     std::int64_t start = now_ns();
-    explicit Scope(Phase p) : phase(p) {}
-    ~Scope() { add(phase, std::uint64_t(now_ns() - start)); }
+    int outer;  // the phase of this thread's Scope around this one, -1 for none
+    explicit Scope(Phase p) : phase(p), outer(innermost()) {
+        if (outer >= 0) leave(outer);
+        enter(int(p), start);
+        innermost() = int(p);
+    }
+    ~Scope() {
+        const std::int64_t end = now_ns();
+        add(phase, std::uint64_t(end - start));
+        leave(int(phase));
+        if (outer >= 0) enter(outer, end);
+        innermost() = outer;
+    }
+    static int& innermost() {
+        thread_local int phase_of_this_thread = -1;
+        return phase_of_this_thread;
+    }
+    static void enter(int p, std::int64_t at) {
+        Totals& t = totals();
+        if (t.active[p].fetch_add(1, std::memory_order_relaxed) == 0) t.active_since[p].store(at, std::memory_order_relaxed);
+    }
+    static void leave(int p) { totals().active[p].fetch_sub(1, std::memory_order_relaxed); }
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
 };
+
+// The phase that some thread has been in longest, -1 when none is in one.
+struct Running {
+    int phase = -1;
+    std::int64_t since = 0;
+};
+inline Running running() {
+    Totals& t = totals();
+    Running r;
+    for (unsigned p = 0; p < kCount; ++p) {
+        if (!t.active[p].load(std::memory_order_relaxed)) continue;
+        const std::int64_t since = t.active_since[p].load(std::memory_order_relaxed);
+        if (r.phase < 0 || since < r.since) r = {int(p), since};
+    }
+    return r;
+}
 
 // After each submission: counts it, and prints the line when the period has passed. One thread wins the line.
 inline void submitted() {

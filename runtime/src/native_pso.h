@@ -100,10 +100,21 @@ struct BlendRegisters {
     std::array<std::uint32_t, 8> blend{};   // CB_BLENDn_CONTROL
 };
 
+// The depth, stencil and raster registers of state blob A (RT-SLOT57-DEPTH-RASTER, docs/fspx.md "State blob A").
+struct DepthRasterRegisters {
+    std::uint32_t clip_cntl = 0;            // PA_CL_CLIP_CNTL
+    std::uint32_t mode_cntl = 0;            // PA_SU_SC_MODE_CNTL
+    std::uint32_t depth_control = 0;        // DB_DEPTH_CONTROL
+    std::uint32_t stencil_control = 0;      // DB_STENCIL_CONTROL
+    std::uint32_t stencil_ref_mask = 0;     // DB_STENCILREFMASK
+    std::uint32_t stencil_ref_mask_bf = 0;  // DB_STENCILREFMASK_BF
+};
+
 // State blob B. The u32 field widths after each name are a hypothesis that fits the
 // measured sizes: 0x50 bytes with no element, and 188 bytes with POSITION, COLOR and TEXCOORD.
 struct FixedState {
     std::optional<BlendRegisters> blend;        // from blob A; empty when blob A is absent or not the measured shape
+    std::optional<DepthRasterRegisters> depth_raster;  // from blob A, likewise
     std::array<std::uint8_t, 8> rtv_formats{};  // +0x10, DXGI_FORMAT values
     std::uint32_t sample_mask = 0;              // +0x1c
     std::uint8_t dsv_format = 0;                // +0x24
@@ -168,8 +179,11 @@ inline std::optional<FixedState> decode_state_b(std::span<const std::uint8_t> b,
 // shape is not decoded: the caller keeps its defaults.
 inline constexpr std::uint32_t kStateATag = 0x4005d800;
 inline constexpr std::size_t kStateATargetMask = 0x78, kStateABlend = 0xd0, kStateAMeshShift = 84;
+inline constexpr std::size_t kStateAClip = 0x9c, kStateAMode = 0xa0, kStateADepth = 0xb8, kStateAStencil = 0xbc,
+                             kStateARefMask = 0xc0, kStateARefMaskBf = 0xc4;
 
-inline std::optional<BlendRegisters> decode_state_a_blend(std::span<const std::uint8_t> a, const char** why = nullptr) {
+// The offset shift of a measured blob A shape (0 for vertex pipelines, 84 for mesh ones), or empty.
+inline std::optional<std::size_t> state_a_shift(std::span<const std::uint8_t> a, const char** why) {
     const auto fail = [&](const char* reason) {
         if (why) *why = reason;
         return std::nullopt;
@@ -180,9 +194,31 @@ inline std::optional<BlendRegisters> decode_state_a_blend(std::span<const std::u
     else if (n >= 464 && n <= 520 && (n - 464) % 8 == 0) shift = kStateAMeshShift;
     else return fail("blob A size not one of the measured shapes");
     if ((read_u32(a, 0) & ~0x18u) != kStateATag) return fail("blob A tag not 0x4005d800");
+    return shift;
+}
+
+inline std::optional<BlendRegisters> decode_state_a_blend(std::span<const std::uint8_t> a, const char** why = nullptr) {
+    const auto shift = state_a_shift(a, why);
+    if (!shift) return std::nullopt;
     BlendRegisters r;
-    r.target_mask = read_u32(a, kStateATargetMask + shift);
-    for (std::size_t i = 0; i < r.blend.size(); ++i) r.blend[i] = read_u32(a, kStateABlend + shift + 4 * i);
+    r.target_mask = read_u32(a, kStateATargetMask + *shift);
+    for (std::size_t i = 0; i < r.blend.size(); ++i) r.blend[i] = read_u32(a, kStateABlend + *shift + 4 * i);
+    return r;
+}
+
+// PA_CL_CLIP_CNTL at +0x9c, PA_SU_SC_MODE_CNTL at +0xa0, DB_DEPTH_CONTROL at +0xb8, DB_STENCIL_CONTROL at +0xbc and
+// DB_STENCILREFMASK(_BF) at +0xc0/+0xc4 (vertex-pipeline offsets), measured as for the blend registers.
+inline std::optional<DepthRasterRegisters> decode_state_a_depth_raster(std::span<const std::uint8_t> a,
+                                                                       const char** why = nullptr) {
+    const auto shift = state_a_shift(a, why);
+    if (!shift) return std::nullopt;
+    DepthRasterRegisters r;
+    r.clip_cntl = read_u32(a, kStateAClip + *shift);
+    r.mode_cntl = read_u32(a, kStateAMode + *shift);
+    r.depth_control = read_u32(a, kStateADepth + *shift);
+    r.stencil_control = read_u32(a, kStateAStencil + *shift);
+    r.stencil_ref_mask = read_u32(a, kStateARefMask + *shift);
+    r.stencil_ref_mask_bf = read_u32(a, kStateARefMaskBf + *shift);
     return r;
 }
 
@@ -271,6 +307,85 @@ inline std::optional<std::array<TargetBlend, 8>> d3d12_blend(const BlendRegister
         out[i] = *t;
     }
     return out;
+}
+
+// The depth, stencil and raster state in D3D12 terms, with D3D12_COMPARISON_FUNC, D3D12_STENCIL_OP and D3D12_CULL_MODE
+// values (d3d12.h). The defaults are the factory's state before blob A was read.
+struct StencilFace {
+    std::uint8_t fail = 1, depth_fail = 1, pass = 1;  // D3D12_STENCIL_OP_KEEP
+    std::uint8_t func = 8;                            // D3D12_COMPARISON_FUNC_ALWAYS
+};
+struct DepthRaster {
+    bool depth_enable = true;     // the factory also turns it off without a DSV
+    bool depth_write = true;      // D3D12_DEPTH_WRITE_MASK_ALL
+    std::uint8_t depth_func = 8;  // D3D12_COMPARISON_FUNC_ALWAYS
+    bool stencil_enable = false;
+    std::uint8_t read_mask = 0xff, write_mask = 0xff;
+    StencilFace front, back;
+    std::uint8_t cull = 1;        // D3D12_CULL_MODE_NONE
+    bool front_ccw = false;
+    bool depth_clip = true;
+};
+
+// An RDNA2 stencil op (V_02842C_STENCIL_*) as a D3D12_STENCIL_OP, or 0. The adding and subtracting ops take
+// STENCILOPVAL as their operand, so they are INCR/DECR only with an operand of 1 (all 6,213 stencil records measured);
+// REPLACE_TEST writes the reference value as D3D12's REPLACE does. ONES, REPLACE_OP and the logic ops have no D3D12 op.
+inline std::uint8_t d3d12_stencil_op(std::uint32_t op, std::uint32_t operand) {
+    switch (op) {
+        case 0: return 1;                    // KEEP
+        case 1: return 2;                    // ZERO
+        case 3: return 3;                    // REPLACE_TEST -> REPLACE
+        case 5: return operand == 1 ? 4 : 0; // ADD_CLAMP -> INCR_SAT
+        case 6: return operand == 1 ? 5 : 0; // SUB_CLAMP -> DECR_SAT
+        case 7: return 6;                    // INVERT
+        case 8: return operand == 1 ? 7 : 0; // ADD_WRAP -> INCR
+        case 9: return operand == 1 ? 8 : 0; // SUB_WRAP -> DECR
+        default: return 0;
+    }
+}
+
+// Empty for a state D3D12 cannot express here: clip space other than D3D's, only one of the near/far z clips off,
+// a polygon mode, culling both faces, depth bounds, the colour-write-on-depth flags, a stencil op without a D3D12 op,
+// or front and back stencil masks that differ (D3D12_DEPTH_STENCIL_DESC has one pair).
+//   PA_CL_CLIP_CNTL: DX_CLIP_SPACE_DEF [19], ZCLIP_NEAR_DISABLE [26], ZCLIP_FAR_DISABLE [27].
+//   PA_SU_SC_MODE_CNTL: CULL_FRONT [0], CULL_BACK [1], FACE [2] (1: clockwise is front), POLY_MODE [4:3].
+//   DB_DEPTH_CONTROL: STENCIL_ENABLE [0], Z_ENABLE [1], Z_WRITE_ENABLE [2], DEPTH_BOUNDS_ENABLE [3], ZFUNC [6:4],
+//     BACKFACE_ENABLE [7], STENCILFUNC [10:8], STENCILFUNC_BF [22:20], bits 30 and 31 the colour-write flags.
+//   DB_STENCIL_CONTROL: STENCILFAIL [3:0], STENCILZPASS [7:4], STENCILZFAIL [11:8], and the _BF ones at +12.
+//   DB_STENCILREFMASK: STENCILMASK [15:8], STENCILWRITEMASK [23:16], STENCILOPVAL [31:24].
+// RDNA2 compare functions run NEVER..ALWAYS as 0..7, D3D12's as 1..8.
+inline std::optional<DepthRaster> d3d12_depth_raster(const DepthRasterRegisters& r) {
+    DepthRaster s;
+    const std::uint32_t clip = r.clip_cntl, mode = r.mode_cntl, d = r.depth_control;
+    if (!(clip >> 19 & 1) || (clip >> 26 & 1) != (clip >> 27 & 1)) return std::nullopt;
+    s.depth_clip = !(clip >> 26 & 1);
+    if (mode >> 3 & 3 || (mode & 3) == 3) return std::nullopt;
+    s.cull = (mode & 1) ? 2 : (mode & 2) ? 3 : 1;  // FRONT, BACK, NONE
+    s.front_ccw = !(mode >> 2 & 1);
+    if (d >> 3 & 1 || d >> 30) return std::nullopt;
+    s.depth_enable = d >> 1 & 1;
+    s.depth_write = d >> 2 & 1;
+    s.depth_func = static_cast<std::uint8_t>((d >> 4 & 7) + 1);
+    s.stencil_enable = d & 1;
+    if (!s.stencil_enable) return s;
+    if ((r.stencil_ref_mask & 0x00ffff00) != (r.stencil_ref_mask_bf & 0x00ffff00)) return std::nullopt;
+    s.read_mask = static_cast<std::uint8_t>(r.stencil_ref_mask >> 8);
+    s.write_mask = static_cast<std::uint8_t>(r.stencil_ref_mask >> 16);
+    const auto face = [&](std::uint32_t ops, std::uint32_t func, std::uint32_t operand) -> std::optional<StencilFace> {
+        StencilFace f;
+        f.fail = d3d12_stencil_op(ops & 15, operand);
+        f.pass = d3d12_stencil_op(ops >> 4 & 15, operand);
+        f.depth_fail = d3d12_stencil_op(ops >> 8 & 15, operand);
+        f.func = static_cast<std::uint8_t>(func + 1);
+        if (!f.fail || !f.pass || !f.depth_fail) return std::nullopt;
+        return f;
+    };
+    const auto front = face(r.stencil_control, d >> 8 & 7, r.stencil_ref_mask >> 24);
+    const auto back = (d >> 7 & 1) ? face(r.stencil_control >> 12, d >> 20 & 7, r.stencil_ref_mask_bf >> 24) : front;
+    if (!front || !back) return std::nullopt;
+    s.front = *front;
+    s.back = *back;
+    return s;
 }
 
 using Digest = std::array<std::uint8_t, 16>;
@@ -413,7 +528,10 @@ inline Plan plan(const GraphicsDesc& desc, const HashMap& map) {
     auto state = decode_state_b(bytes(desc.state_b), &p.reason);
     if (!state) return p;
     p.state = std::move(*state);
-    if (pair_state(desc.state_a) == PairState::present) p.state.blend = decode_state_a_blend(bytes(desc.state_a));
+    if (pair_state(desc.state_a) == PairState::present) {
+        p.state.blend = decode_state_a_blend(bytes(desc.state_a));
+        p.state.depth_raster = decode_state_a_depth_raster(bytes(desc.state_a));
+    }
     for (std::size_t k = 0; k < kStageBlocks; ++k) {
         const StageBlock& block = desc.stages[k];
         const PairState code = pair_state(block.code), records = pair_state(block.records);

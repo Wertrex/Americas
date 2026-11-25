@@ -133,7 +133,14 @@ with the seed on stderr; a seed of 0 uses a fixed non-zero state. Unset, the hos
 ## PE loader
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
-that base is taken, copies headers and sections, applies `IMAGE_REL_BASED_DIR64` relocations, binds
+that base is taken. An image with a relocation table is moved and fixed up whatever `IMAGE_FILE_RELOCS_STRIPPED`
+says; without one, the flag refuses the move, and an image with the flag clear is moved with nothing fixed up (the
+loader logs that). The Windows 11 (build 26200) loader does the same in these three cases, as Zombins2 measured
+with synthetic DLLs in a review of old pull request 8847 of the original repository, which is no longer readable.
+Open question from the same measurement: Windows also refused flag-set DLLs without a relocation directory at a free
+preferred base (error 487, linker-built `/FIXED` DLLs included), and why is not known; the loader still maps those
+at their base, as before. It copies headers and sections, applies `IMAGE_REL_BASED_DIR64` and `HIGHLOW` relocations
+(rejecting the other types, such as `HIGH`, `LOW` and `HIGHADJ`, which no x64 MSVC image contains), binds
 imports by name or ordinal, parses the export table, sets section protections, and registers the
 image's x64 unwind table (`.pdata`) with `RtlAddFunctionTable`, so exceptions raised in or passing
 through a mapped image are dispatched and stack walks can step over its frames. The table is validated
@@ -321,7 +328,8 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_LAZY_PIPELINES` | on | Graphics pipelines are built at their first draw. `0` builds each at `CreatePipelineState`, as before; the title creates far more pipelines at startup than it draws with. |
 | `LEONIDA_LAZY_COMPUTE` | on | Compute pipelines are built at the first dispatch that names them, or earlier by the warm-up thread. `0` builds each at `CreateComputePipelineState`. |
 | `LEONIDA_COMPUTE_WARMUP_MAX_BYTES` | `1048576` | The largest SPIR-V module, in bytes, the background warm-up thread (`LEONIDA_COMPUTE_WARMUP`) builds ahead of its first dispatch. Larger modules wait for that dispatch. |
-| `LEONIDA_SERIAL_BIG_COMPILES` | on | Compute modules over 128 KiB of SPIR-V compile one at a time, because the driver's compiler needs hundreds of MiB for each. `0` lets them compile side by side. |
+| `LEONIDA_SERIAL_BIG_COMPILES` | unset | Large pipelines (compute modules over 128 KiB of SPIR-V, graphics pipelines of 1 MiB or more) compile side by side while their estimates, 512 bytes of memory for each byte of SPIR-V, fit a budget (`LEONIDA_BIG_COMPILE_BUDGET_MB`): one always does, what a submission waits for goes before the warm-up, and the warm-up takes a quarter of the budget at most. `1` compiles the compute ones one at a time, and the graphics ones of a submission one after another, as before there was a budget. `0` lets all of them compile side by side. |
+| `LEONIDA_BIG_COMPILE_BUDGET_MB` | unset | The budget, in MiB: a fixed number (`0`: one large pipeline at a time) instead of three quarters of the memory that is free at the moment, which is the smaller of the free RAM and the room under the commit limit, read again for each pipeline. Text that is not a number is ignored. |
 | `LEONIDA_CONSOLE_FORMATS` | on | Texture descriptions the console accepts and a PC GPU may not (an R9G9B9E5 render target, an sRGB RGBA8 or BGRA8 texture with unordered access) get a host format that can do the job. `0` refuses them, as a PC D3D12 runtime does. |
 | `LEONIDA_CONSOLE_HEAP_SHADOW` | on | A console descriptor heap has a copy in the descriptor arena that the shaders read. `0` keeps its bytes in the title's memory only (the comparison for a run that misbehaves with the copy). |
 | `LEONIDA_IMPORT_BELOW_ARENA` | unset | `1` keeps a host-memory import that the driver put below the GPU address arena. By default such an import is not used and the shadow buffer in the arena answers, because a V# cannot name an address below the arena. |
@@ -365,7 +373,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_WINDOW` | unset | `WxH` resizes the title's window when the presenter attaches to it. |
 | `LEONIDA_PRESENT_DUMP` | unset | *Diagnostic.* `DIR` or `DIR,N` writes every Nth presented frame (60 by default) as a PNG into `DIR` (`src/present_dump.h`). The files are pictures of the title: keep them out of commits, issues and pull requests. |
 | `LEONIDA_LOCAL_SPEECH` | unset | `1` forwards the title's speech-synthesis calls to the host's installed `xgameruntime.dll` where there is one. Unset, and wherever that library is missing, the silent voice answers. No profile sets it. |
-| `LEONIDA_CONSOLE_FIX_US` | `4000` | Microseconds one submission may spend fixing the changed slots of a console descriptor heap's copy. Past it, each further changed slot is written as a null descriptor and queued for `LEONIDA_CONSOLE_RETRY_US`, so a shader reads it as empty until its turn comes. `0` removes the limit. |
+| `LEONIDA_CONSOLE_FIX_US` | `0` | Microseconds one submission may spend fixing the changed slots of a console descriptor heap's copy; `0` sets no limit. Past it, each further changed slot is written as a null descriptor and queued for `LEONIDA_CONSOLE_RETRY_US`, so a shader reads it as empty until its turn comes: a limit changes results, and can hang the GPU. |
 | `LEONIDA_CONSOLE_RETRY_US` | `500` | Microseconds one submission may spend retrying, round robin, the console heap slots not settled yet (a T# whose texture does not exist yet, or one deferred by `LEONIDA_CONSOLE_FIX_US`). `0` retries all of them at every submission. |
 | `LEONIDA_SHADOW_ALIAS_MS` | `0` | The shortest time, in milliseconds, between two copies of the title-memory pages that XMem maps at two addresses (no write guard can watch them) into the slot-133 shadows and title windows. `0` copies them at every submission; a larger value lets a GPU read of them be up to that many milliseconds behind the title's writes. |
 | `LEONIDA_REFRESH_PER_FRAME` | `0` | Trades correctness for speed. `1`: the slot-133 shadows, title windows and geometry copies are brought up to date only by the first submission after each present, not by every submission; `2`: the console descriptor heaps too. A GPU read of them can then be a frame behind the title's writes (wrong pixels). `0` refreshes all of them at every submission. |
@@ -390,6 +398,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_PASS_TRACE` | unset | *Diagnostic.* `n`, with `LEONIDA_DEVICE_FAULT=1`: in the frame after every `n`-th present, each submission logs its compute programs in order, repeats folded (`src/vulkan_backend.h`), for the frame's pass order. |
 | `LEONIDA_GPU_LATENCY` | unset | *Diagnostic.* `1` logs, every 10 s for each queue kind, how long the GPU took from a submission's `vkQueueSubmit` to it being seen done, and the share of the wall time the queue had work (`src/vulkan_backend.h`). |
 | `LEONIDA_SUBMIT_PHASES_SECONDS` | `5` | *Diagnostic.* The period, in seconds, of the always-on line that says how many submissions there were and where their CPU time went, phase by phase (`src/submit_phases.h`). `0` turns the line off. |
+| `LEONIDA_DEV_OVERLAY` | unset | *Diagnostic, Windows.* `1` draws what the runtime is doing over the top left corner of the title's window (`src/dev_overlay.h`): frame and submission rate, a submission's CPU time by phase, the phase running now, pipeline builds, indirect draws, cores and memory. |
 | `LEONIDA_SAMPLE_MS` | unset | *Diagnostic.* `ms` starts the thread sampler (`src/thread_sampler.h`): every `ms` milliseconds each thread of the process that used CPU since the last look is suspended just long enough to copy its context, its stack is unwound afterwards, and a periodic report lists the busiest threads and their most frequent call chains (eight frames, innermost first). |
 | `LEONIDA_SAMPLE_REPORT_S` | `10` | *Diagnostic.* Seconds between two reports of the thread sampler (`LEONIDA_SAMPLE_MS`). |
 | `LEONIDA_SAMPLE_WAITS` | unset | *Diagnostic.* `1` makes the thread sampler sample waiting threads too, not only those that used CPU, and list each thread's most frequent chain, so a thread that waits shows where. |
@@ -601,10 +610,11 @@ from the ANSI code page.
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
+| `delay_import_unimplemented` | at load, for each delay import that binds to an unimplemented thunk (Windows would raise `0xC06D007E`/`0xC06D007F` at its first call; [runtime_imports.md](../docs/runtime_imports.md#delay-imports-and-thread-events-where-the-loader-differs-from-windows)) | `module`, `import` (`dll!name`) |
 | `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault`, `XMemFreeDefault` and `XMemVirtualAlloc` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (not for the frees), `caller` (module+RVA) |
 | `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
-| `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
+| `int3_skipped` | with `LEONIDA_SKIP_INT3` set when the trace opens: first int3 at each address, which is then stepped over (after 4096 distinct addresses, a new one is logged each time it is hit) | `at` (module+RVA) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
 | `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
 | `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |

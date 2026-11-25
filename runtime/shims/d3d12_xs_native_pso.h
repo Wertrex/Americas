@@ -76,16 +76,50 @@ inline void fill_blend_state(const np::FixedState& s, D3D12_BLEND_DESC& out) {
     }
 }
 
+// The depth, stencil and raster state of blob A's registers (RT-SLOT57-DEPTH-RASTER). Without them, or for a state
+// this path cannot express (np::d3d12_depth_raster), the defaults below stay, as before: depth ALWAYS with writes
+// where there is a DSV, no stencil, no culling, depth clip on. Depth bias is not decoded and stays 0.
+inline void fill_depth_raster_state(const np::FixedState& s, D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc) {
+    const auto dr = s.depth_raster ? np::d3d12_depth_raster(*s.depth_raster) : std::nullopt;
+    if (!dr) {
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 57: %s, so this pipeline keeps the default depth and raster state "
+                         "(DB_DEPTH_CONTROL %08x, PA_SU_SC_MODE_CNTL %08x)\n",
+                         s.depth_raster ? "blob A's depth, stencil or raster state is not one this path builds"
+                                        : "blob A is absent or not the measured shape",
+                         s.depth_raster ? static_cast<unsigned>(s.depth_raster->depth_control) : 0u,
+                         s.depth_raster ? static_cast<unsigned>(s.depth_raster->mode_cntl) : 0u);
+    }
+    const np::DepthRaster state = dr ? *dr : np::DepthRaster{};
+    auto& r = pc.RasterizerState;
+    r.FillMode = D3D12_FILL_MODE_SOLID;
+    r.CullMode = static_cast<D3D12_CULL_MODE>(state.cull);
+    r.FrontCounterClockwise = state.front_ccw;
+    r.DepthClipEnable = state.depth_clip;
+    auto& ds = pc.DepthStencilState;
+    ds.DepthEnable = state.depth_enable;
+    ds.DepthWriteMask = state.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    ds.DepthFunc = static_cast<D3D12_COMPARISON_FUNC>(state.depth_func);
+    ds.StencilEnable = state.stencil_enable;
+    ds.StencilReadMask = state.read_mask;
+    ds.StencilWriteMask = state.write_mask;
+    const auto face = [](const np::StencilFace& f) {
+        return D3D12_DEPTH_STENCILOP_DESC{static_cast<D3D12_STENCIL_OP>(f.fail), static_cast<D3D12_STENCIL_OP>(f.depth_fail),
+                                          static_cast<D3D12_STENCIL_OP>(f.pass), static_cast<D3D12_COMPARISON_FUNC>(f.func)};
+    };
+    ds.FrontFace = face(state.front);
+    ds.BackFace = face(state.back);
+    // Without a DSV the console has nothing to test or write (27 records enable Z with none).
+    if (pc.DSVFormat == DXGI_FORMAT_UNKNOWN) ds.DepthEnable = ds.StencilEnable = FALSE;
+}
+
 inline void fill_fixed_state(const np::FixedState& s, D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc) {
     fill_blend_state(s, pc.BlendState);
     pc.SampleMask = s.sample_mask ? s.sample_mask : UINT_MAX;
-    pc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pc.RasterizerState.DepthClipEnable = TRUE;
     pc.DSVFormat = static_cast<DXGI_FORMAT>(s.dsv_format);
-    pc.DepthStencilState.DepthEnable = pc.DSVFormat != DXGI_FORMAT_UNKNOWN;
-    pc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    fill_depth_raster_state(s, pc);
     pc.PrimitiveTopologyType = s.topology_type ? static_cast<D3D12_PRIMITIVE_TOPOLOGY_TYPE>(s.topology_type)
                                                : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pc.NumRenderTargets = s.rt_count;

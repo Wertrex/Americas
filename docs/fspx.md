@@ -276,8 +276,8 @@ title calls device slot 57 (`+0x1c8`) with `IID_ID3D12PipelineState` (`{765a30f3
   - `state blob`: `+0x000` version tag (`0x4005d800` in 15,632 records, `0x4005d808` in 9,159, `0x4005d810` in 6),
     `+0x004` family (`4` in 12,735 or `6` in 12,062), `+0x02c = 2`, `+0x07c` (`0xcc0010` / `0` / `0xcc0011`),
     `+0x0f4 = 5`, `+0x0f8 = 1`, `+0x0fc = 0x33333333` (`0.1f`), `+0x100..+0x11c` (`0x00060006` x8), `+0x150 = 0x40`,
-    `+0x158 = 0xffffffff`, `+0x17c = 0x10000a00`. The colour-target registers are decoded (next paragraph); raster
-    and depth state are not, and keep the factory's defaults.
+    `+0x158 = 0xffffffff`, `+0x17c = 0x10000a00`. The colour-target, depth, stencil and raster registers are decoded
+    (next paragraphs); depth bias is not.
   - `stage blob`: `+0x00 = 2` (graphics stage blob), `+0x04` payload size (`196` in 208 B blobs), `+0x08 = 0x66`,
     `+0x0c = 0x40 | flags`, followed by records `0x41` (32 B input/output signature), `0x42` (32 B output signature)
     and `0x43` (20 B: tag + 16 B opaque digest).
@@ -326,6 +326,41 @@ headers). Measured on 1.0.2.1 over all 5,680 distinct blobs, which the 25,471 gr
   (`runtime/src/dual_source_fragment.h`, RT-DUAL-SOURCE-BLEND).
 - **Kept on the defaults:** a blob of another shape, or a target with a factor or function this path does not take,
   keeps the whole pipeline on the defaults and is logged.
+
+**State blob A: the depth, stencil and raster registers (RT-SLOT57-DEPTH-RASTER).** The same shared block, at the
+same vertex-pipeline offsets (+84 in mesh pipelines). The register layouts and their checks against blob B are below,
+measured over all 25,471 graphics records:
+
+- **`+0x9c` `PA_CL_CLIP_CNTL`:** `DX_CLIP_SPACE_DEF` set in every record. Both z clips are off in 960 records and on
+  in the rest, so the near and far planes always agree.
+- **`+0xa0` `PA_SU_SC_MODE_CNTL`:** no culling in 13,534 records, back faces in 11,873 and front faces in 62.
+  `FACE` (clockwise is front) is clear in all but 2, `POLY_MODE` is 0 in all, and the polygon-offset enables are set
+  in all.
+- **`+0xb8` `DB_DEPTH_CONTROL`:**
+  - with no DSV in blob B, `Z_ENABLE` is clear in 7,040 of 7,079 records;
+  - `STENCIL_ENABLE` is set only with formats that have stencil;
+  - `DEPTH_BOUNDS_ENABLE` and bits 30-31 are clear in all;
+  - `BACKFACE_ENABLE` is set in all;
+  - the test is off (`0x007007f0`) in 9,062 records, otherwise mostly `GEQUAL` (a reversed depth range), with `LESS`,
+    `LEQUAL`, `EQUAL` and `NOTEQUAL` in some.
+- **`+0xbc` `DB_STENCIL_CONTROL`:** nonzero in 5,512 of the 6,213 records with stencil on, and in 2 without. The ops
+  used are `KEEP`, `REPLACE_TEST`, `ADD_WRAP`, `ZERO` and `INVERT`.
+- **`+0xc0`/`+0xc4` `DB_STENCILREFMASK(_BF)`:** the two faces have the same read and write masks in every stencil
+  record, and `STENCILOPVAL` is 1 in all. `STENCILTESTVAL` (bits 7:0, the reference) is 0 in all 6,213 stencil records, front and
+  back, so the reference always comes from the title (`OMSetStencilRef`) and the PSO does not need it. 245 records use a back-face function of their own.
+
+`runtime/src/native_pso.h` (`decode_state_a_depth_raster`, `d3d12_depth_raster`) maps them to
+`D3D12_DEPTH_STENCIL_DESC` and the cull, front-face and depth-clip fields of `D3D12_RASTERIZER_DESC`, and
+`fill_depth_raster_state` in `runtime/shims/d3d12_xs_native_pso.h` uses them for every native PSO:
+
+- **Before:** depth `ALWAYS` with writes wherever there was a DSV, no stencil, no culling and depth clip on.
+- **With the decoded state:** every one of the 25,471 records maps. A pipeline without a DSV keeps depth and stencil
+  off.
+- **Not decoded:** depth bias (`PA_SU_POLY_OFFSET_*`). Its D3D12 units depend on the depth format, so it stays 0.
+  The polygon-offset enables in `PA_SU_SC_MODE_CNTL` are set in all 25,471 records. The values look like the floats at
+  `+0xac`/`+0xb0` (scale and offset), which are both 0 in 23,987 records and nonzero in about 1,480.
+- **Front face:** `FACE` is the only field whose effect can't be seen before a world frame. It maps to
+  `FrontCounterClockwise = !FACE`, as RADV and PAL program it.
 
 ## Translation status
 
