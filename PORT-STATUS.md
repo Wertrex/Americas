@@ -1,8 +1,8 @@
 # Port status (wertrex-port branch)
 
-A personal branch of [ubiquitarianism/leonida](https://github.com/ubiquitarianism/leonida), itself a continuation of
-Leonida, licensed GPLv3. It contains **no game data, keys, executables or shaders**, and it does not explain how to
-obtain them. You need your own copy of the Xbox Series package, version 1.0.2.1, as plain files on disk. See
+A personal branch of the open-source project this repository was forked from (see the fork link at the top of the
+page; GPLv3, credits in [README.md](README.md) and [LICENSE](LICENSE)). It contains **no game data, keys, executables
+or shaders**, and it does not explain how to obtain them. You need your own copy of the Xbox Series package, version 1.0.2.1, as plain files on disk. See
 [README.md](README.md) for the build and [AGENTS.md](AGENTS.md) for the repository rules.
 
 **Status: early. Not playable.** The game starts and reaches its first-run screens. It does not reach the open world.
