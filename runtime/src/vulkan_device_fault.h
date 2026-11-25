@@ -26,6 +26,13 @@ namespace leonida {
 
 // The GPU address arena's device address, set by the D3D12 layer, so a faulting address can be read back as the
 // console VA a translated shader computed (heap_base + VA).
+// Called with each invalid-access address the driver reports, so the layer can say what it knows about that device
+// address (a backing that was registered there and freed, or none ever).
+inline std::function<void(std::uint64_t)>& fault_address_hook() {
+    static std::function<void(std::uint64_t)> hook;
+    return hook;
+}
+
 inline std::atomic<std::uint64_t>& fault_heap_base() {
     static std::atomic<std::uint64_t> base{0};
     return base;
@@ -421,8 +428,20 @@ private:
             std::fprintf(stderr, "[rt] device-fault: address[%zu] type=%d address=0x%" PRIx64
                                  " precision=%" PRIu64 "\n",
                          i, int(address.addressType), address.reportedAddress, address.addressPrecision);
+            if ((address.addressType == VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT ||
+                 address.addressType == VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT) && fault_address_hook())
+                fault_address_hook()(address.reportedAddress);
 #ifdef _WIN32
             // An invalid read or write: is heap_base + VA, VA being a console VA, memory the title really has?
+            {
+                // The address as the title's own memory: a raw 64-bit pointer a shader dereferenced.
+                MEMORY_BASIC_INFORMATION raw{};
+                const SIZE_T rn = VirtualQuery(reinterpret_cast<const void*>(address.reportedAddress), &raw, sizeof(raw));
+                std::fprintf(stderr, "[rt] device-fault: address[%zu] as a title address: %s base=%p alloc_base=%p region=0x%zx "
+                                     "state=0x%lx protect=0x%lx type=0x%lx\n",
+                             i, rn ? "queried" : "VirtualQuery failed", raw.BaseAddress, raw.AllocationBase, raw.RegionSize,
+                             raw.State, raw.Protect, raw.Type);
+            }
             const std::uint64_t heap = fault_heap_base().load(std::memory_order_relaxed);
             if (heap && (address.addressType == VK_DEVICE_FAULT_ADDRESS_TYPE_READ_INVALID_EXT ||
                          address.addressType == VK_DEVICE_FAULT_ADDRESS_TYPE_WRITE_INVALID_EXT)) {

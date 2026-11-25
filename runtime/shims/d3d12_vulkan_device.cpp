@@ -114,6 +114,14 @@ namespace {
 // Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
 // increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the device, as it must.
 constexpr UINT kDescriptorSize = descriptor_size;
+// LEONIDA_ARENA_TABLE_FIX=0 turns off the fix of per-draw V# tables that sit in the arena outside every descriptor heap.
+inline bool arena_table_fix_enabled() {
+    static const bool on = [] {
+        char v[2]{};
+        return GetEnvironmentVariableA("LEONIDA_ARENA_TABLE_FIX", v, sizeof v) != 1 || v[0] != '0';
+    }();
+    return on;
+}
 // The first 64 KiB of the GPU address arena are never handed out: VA 0 stays invalid, and the page is kept zero
 // for unbound vertex and index buffers to read (D3D12 reads zeros there).
 constexpr VkDeviceSize kZeroPage = 64 * 1024;  // zeroed: what unbound vertex and index buffers read
@@ -2876,16 +2884,56 @@ struct DeviceState {
         probe_table(table_va, descriptors);  // LOCAL DIAGNOSTIC
         VkDeviceSize end = 0;
         bool sampler = false;
+        bool outside_table = false;
         {
             std::lock_guard lock(visible_heap_mutex);
             auto it = visible_heaps.upper_bound(table_va);
-            if (it == visible_heaps.begin()) return;
-            --it;
-            const auto& heap = it->second;
-            if (table_va >= heap.end || (table_va - it->first) % kDescriptorSize != 0) return;
-            sampler = heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-            const auto slots = sampler ? descriptors : std::min(descriptors, kViewScanLimit);
-            end = table_va + std::min<VkDeviceSize>(heap.end - table_va, VkDeviceSize(slots) * kDescriptorSize);
+            const auto unscanned = [&](const char* why) {
+                // LOCAL DIAGNOSTIC: a bound table outside every visible heap is never fixed (V# bases stay raw).
+                static std::atomic<unsigned> logged{0}, total{0};
+                ++total;
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 12)
+                    std::fprintf(stderr, "[rt] scan-table: not scanned (%s): table 0x%llx, %u descriptors, arena size 0x%llx, "
+                                         "%zu visible heaps\n", why, (unsigned long long)table_va, descriptors,
+                                         (unsigned long long)arena.size, visible_heaps.size());
+            };
+            // A table in the arena but outside every visible heap (a per-draw table the title built in its own memory,
+            // mirrored in the arena): its V#s still hold the title's raw bases, so a shader that loads one reads
+            // heap_base + a raw VA and the device is lost. Fixed in place, after the lock, like a heap's slots.
+            if (arena_table_fix_enabled() && table_va + kDescriptorSize <= arena.size && arena.mapped &&
+                (it == visible_heaps.begin() || table_va >= std::prev(it)->second.end)) {
+                outside_table = true;
+            } else {
+                if (it == visible_heaps.begin()) { unscanned("below every heap"); return; }
+                --it;
+                const auto& heap = it->second;
+                if (table_va >= heap.end || (table_va - it->first) % kDescriptorSize != 0) {
+                    unscanned(table_va >= heap.end ? "past the nearest heap" : "misaligned in a heap");
+                    return;
+                }
+                sampler = heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+                const auto slots = sampler ? descriptors : std::min(descriptors, kViewScanLimit);
+                end = table_va + std::min<VkDeviceSize>(heap.end - table_va, VkDeviceSize(slots) * kDescriptorSize);
+            }
+        }
+        if (outside_table) {
+            // A few more than declared: shaders read the next descriptors too (a V# at +0x40).
+            const std::uint64_t slots = std::min<std::uint64_t>(std::max<std::uint32_t>(descriptors, 4u), 16u);
+            const VkDeviceSize last = std::min<VkDeviceSize>(arena.size, table_va + slots * kDescriptorSize);
+            std::uint32_t before[8]{}, after[8]{};
+            std::memcpy(before, arena.mapped + table_va, sizeof before);
+            for (VkDeviceSize at = table_va; at + kDescriptorSize <= last; at += kDescriptorSize) {
+                auto* const w = reinterpret_cast<std::uint32_t*>(arena.mapped + at);
+                fix_vsharp(w, VsharpPath::shadow);
+                fix_vsharp(w + 4, VsharpPath::shadow);
+            }
+            std::memcpy(after, arena.mapped + table_va, sizeof after);
+            note_table(table_va, before, after);
+            static std::atomic<unsigned> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 3)
+                std::fprintf(stderr, "[rt] scan-table: fixed a table outside every heap at arena offset 0x%llx (%u declared)\n",
+                             (unsigned long long)table_va, descriptors);
+            return;
         }
         auto& aliases = leonida::title_va_aliases();
         // Slots the title wrote in its own backing of this heap, if it gave the heap one.
@@ -2945,12 +2993,86 @@ struct DeviceState {
     std::atomic<uint64_t> released_backings{};
     std::mutex backing_mutex;
     leonida::BufferVaIndex<uint64_t> gpu_backings;
+    // Every registration and release of a GPU backing, in order, for the device-fault report: what was at an address
+    // the GPU read invalidly, and when it was released.
+    struct BackingEvent { VkDeviceAddress address; uint64_t bytes, id; bool add; uint64_t seq; };
+    std::vector<BackingEvent> backing_events;
     void backing(VkDeviceAddress address, uint64_t bytes, uint64_t id, bool add) {
         std::lock_guard lock(backing_mutex);
+        if (backing_events.size() < (1u << 22))
+            backing_events.push_back({address, bytes, id, add, backing_events.size()});
         if (add) gpu_backings.insert(address, bytes, id);
         else {
             gpu_backings.erase(address, id);
             released_backings.fetch_add(1, std::memory_order_release);
+        }
+    }
+    // LOCAL DIAGNOSTIC: the V# words of the last tables fixed outside every heap, before and after the fix.
+    struct TableRecord { uint64_t table, seq; uint32_t before[8], after[8]; };
+    std::mutex table_ring_mutex;
+    std::vector<TableRecord> table_ring = std::vector<TableRecord>(2048);
+    uint64_t table_ring_seq = 0;
+    void note_table(uint64_t table, const uint32_t* before, const uint32_t* after) {
+        std::lock_guard lock(table_ring_mutex);
+        auto& r = table_ring[table_ring_seq % table_ring.size()];
+        r.table = table; r.seq = ++table_ring_seq;
+        std::memcpy(r.before, before, sizeof r.before);
+        std::memcpy(r.after, after, sizeof r.after);
+    }
+    void report_fault_tables(uint64_t fault) {
+        std::lock_guard lock(table_ring_mutex);
+        unsigned shown = 0, total = 0;
+        const uint64_t page = fault >> 12;
+        for (const auto& r : table_ring) {
+            if (!r.seq) continue;
+            ++total;
+            for (int v = 0; v < 2; ++v) {
+                for (int which = 0; which < 2; ++which) {
+                    const uint32_t* w = (which ? r.after : r.before) + v * 4;
+                    const uint64_t base = uint64_t(w[0] & ~3u) | (uint64_t(w[1] & 0xFFFFu) << 32);
+                    const uint64_t sext = (base & (1ull << 47)) ? (base | ~((1ull << 48) - 1)) : base;
+                    if (((arena.address + sext) >> 12) == page && shown < 6) {
+                        ++shown;
+                        std::fprintf(stderr, "[rt] fault-table: seq %llu table 0x%llx slot %d %s fix: %08x %08x %08x %08x (the faulting base)\n",
+                                     (unsigned long long)r.seq, (unsigned long long)r.table, v, which ? "after" : "before",
+                                     w[0], w[1], w[2], w[3]);
+                    }
+                }
+            }
+        }
+        std::fprintf(stderr, "[rt] fault-table: %u recorded tables, %u had the faulting base%s\n", total, shown,
+                     shown ? "" : " (none: the V# came from somewhere else)");
+    }
+    void report_fault_address(uint64_t fault) {
+        report_fault_tables(fault);
+        std::lock_guard lock(backing_mutex);
+        const auto total = backing_events.size();
+        unsigned shown = 0;
+        std::fprintf(stderr, "[rt] backing-history: %zu events; GPU read invalid address 0x%llx (arena 0x%llx..+0x%llx)\n",
+                     total, (unsigned long long)fault, (unsigned long long)arena.address, (unsigned long long)arena.size);
+        for (const auto& e : backing_events) {
+            if (!e.add || fault < e.address || fault >= e.address + (e.bytes ? e.bytes : 1)) continue;
+            // when was the same id released?
+            long long released = -1;
+            for (const auto& r : backing_events)
+                if (!r.add && r.id == e.id && r.seq > e.seq) { released = (long long)r.seq; break; }
+            std::fprintf(stderr, "[rt] backing-history: covered by [0x%llx, +0x%llx) id=%llu added at event %llu, %s\n",
+                         (unsigned long long)e.address, (unsigned long long)e.bytes, (unsigned long long)e.id,
+                         (unsigned long long)e.seq,
+                         released < 0 ? "still registered" : ("released at event " + std::to_string(released)).c_str());
+            if (++shown >= 8) break;
+        }
+        if (!shown) {
+            // nearest registered range on either side
+            const BackingEvent* below = nullptr; const BackingEvent* above = nullptr;
+            for (const auto& e : backing_events) {
+                if (!e.add) continue;
+                if (e.address + e.bytes <= fault && (!below || e.address + e.bytes > below->address + below->bytes)) below = &e;
+                if (e.address > fault && (!above || e.address < above->address)) above = &e;
+            }
+            std::fprintf(stderr, "[rt] backing-history: no registered backing ever covered it; nearest below 0x%llx+0x%llx, above 0x%llx\n",
+                         below ? (unsigned long long)below->address : 0ull, below ? (unsigned long long)below->bytes : 0ull,
+                         above ? (unsigned long long)above->address : 0ull);
         }
     }
 
@@ -3225,6 +3347,13 @@ struct DeviceState {
 
     void arena_release(VkDeviceSize offset, VkDeviceSize bytes, ArenaUse use) {
         if (!bytes) return;
+        // LOCAL DIAGNOSTIC LEONIDA_ARENA_NO_REUSE=1: a released range is never handed out again (and its backing stays
+        // registered), to tell a GPU read of reused arena memory from every other cause of a bad descriptor read.
+        static const bool no_reuse = [] {
+            char v[2]{};
+            return GetEnvironmentVariableA("LEONIDA_ARENA_NO_REUSE", v, sizeof v) == 1 && v[0] == '1';
+        }();
+        if (no_reuse) return;
         std::lock_guard lock(arena.mutex);
         // The range is validated and merged before the live-byte counters move: a release of a range the arena never
         // had must not change them, and a double free must not count the bytes twice.
@@ -11679,6 +11808,7 @@ public:
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
         leonida::fault_heap_base().store(arena.address, std::memory_order_relaxed);
+        leonida::fault_address_hook() = [this](std::uint64_t fault) { state_.report_fault_address(fault); };
         // The GPU address arena is the console's address space: the title names it by offset, so the label path
         // has to find it (src/gpu_label_memory.h). Its address space starts at 0.
         if (arena.mapped)

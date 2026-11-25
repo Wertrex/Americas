@@ -74,6 +74,27 @@ programs only changes which one faults, and skipping every library compute progr
 one shader. The leading suspect is data a skipped or mistranslated pass should have produced; this is not confirmed.
 A small diagnostic was added: the device-fault report now queries the faulting address minus the arena base.
 
+## GPU-loss investigation (26 November 2026)
+
+With NVIDIA Nsight Aftermath the runtime now names the shader and the instruction behind each `VK_ERROR_DEVICE_LOST`
+(`LEONIDA_AFTERMATH=1`, `LEONIDA_AFTERMATH_KEEP_SPIRV=1`; the SDK is not part of the repository). Findings, from about
+twenty runs on one machine:
+
+- It is **not one shader and not only compute**: the faulting shader differed run to run (vertex and compute programs
+  alike), always an invalid read or write through a buffer descriptor (V#) whose base is garbage, so `heap_base + base`
+  names memory no resource owns. Skipping compute programs (`LEONIDA_SKIP_COMPUTE`) only changes which one faults.
+- The faulting address is often the same value in different runs (for example `0x513ad3235000` in two runs), so it is
+  data, not noise. Where that data comes from is **not found yet**.
+- Not the cause: arena block reuse (`LEONIDA_ARENA_NO_REUSE`, a local diagnostic), the sliced console-heap rescan,
+  `LEONIDA_ARENA_NULL_MB`, mesh draws (already skipped).
+- One real hole found and closed: per-draw V# tables that the title builds in its own memory, mirrored in the arena but
+  outside every registered descriptor heap, were never rebased (`scan_title_table` returned early). They are now fixed in
+  place (`LEONIDA_ARENA_TABLE_FIX=0` turns it off). The GPU is still lost afterwards, so this was one of several causes.
+- New diagnostics in the device-fault report: the faulting address as a title address and as `heap_base` + VA, and
+  the history of registered GPU backings around it.
+
+The world start still fails. Nothing here changes the status above.
+
 ## Not claimed
 
 No gameplay, no 3D world frame, no controllable character. Figures above are from one machine and a handful of runs
