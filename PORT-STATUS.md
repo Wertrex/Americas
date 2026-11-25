@@ -37,6 +37,24 @@ Raising `LEONIDA_TITLE_WINDOWS_MB` from 64 to 512 moves the failure later but do
 reached before the loss (`MiB copied so far: 63`), and with 512 the log reports 511. The cause is not fully pinned
 down; see upstream issue #1537.
 
+## Diagnosis of the world-start failure (25 November 2026)
+
+Measured with `LEONIDA_DEVICE_FAULT=1` and `--trace`. These are observations, not a fix.
+
+- **The game waits for input.** After the first-run screens it sits on its loading slideshow until the pad gets an A
+  press (Enter on the keyboard pad). Without input it idles at 25 frames/s for as long as you leave it.
+- **GPU loss.** `VK_ERROR_DEVICE_LOST` is reported from `vkDeviceWaitIdle` in the title staging path. The checkpoint
+  names one compute dispatch of the occlusion/culling stage (128x64x1 groups) and the driver lists 136 fault
+  addresses inside about 4.7 KB. A timeout of 5 s on queue waits (`LEONIDA_VALUE_WAIT_TIMEOUT_MS`) did not prevent it.
+- **Null write.** With that dispatch skipped (`LEONIDA_SKIP_COMPUTE`, a diagnostic switch) the run no longer loses the
+  GPU but the title dies at `game_scarlett_master.exe+0x23cf683` writing to address 0, about 195 s in; the same
+  offset in three runs. An earlier run died reading address 8 at `+0x108557`.
+- **Failed asset reads before it.** The trace shows two `E_DSTORAGE_DECOMPRESSION_ERROR` (`0x89240030`) at about
+  102 s. The runtime's own BCPack profile is incomplete (BC7 endpoint/index fields 4228/6144), which is a known
+  limitation of the project.
+- **A misleading log line fixed here.** `the releaser ... gate Signal ... for 18446744073709551615 ms` was an unsigned
+  subtraction wrapping by one tick, not a stall.
+
 ## Not claimed
 
 No gameplay, no 3D world frame, no controllable character. Figures above are from one machine and a handful of runs

@@ -602,7 +602,10 @@ private:
             stall_logged_ = false;
             return;
         }
-        const std::uint64_t ms = GetTickCount64() - since;
+        // `since` is the tick at the Signal's start OR-ed with 1, so it can be one tick ahead of now: an unsigned
+        // subtraction then wraps and reports a stall of 18446744073709551615 ms on every Signal that has just begun.
+        const std::uint64_t now_ms = GetTickCount64();
+        const std::uint64_t ms = now_ms > since ? now_ms - since : 0;
         if (ms < kStallMs || stall_logged_) return;
         stall_logged_ = true;
         bump(counters().release_stalls);
