@@ -3211,6 +3211,9 @@ struct DeviceState {
         std::set<std::uint32_t> empty_slots;
         std::uint32_t next_empty = 0;
         std::size_t retry_at = 0;  // where retry_console_slots goes on
+        // The whole-heap rescan after a released backing or an alias change, done in budgeted slices
+        std::size_t rescan_at = 0;
+        bool rescan_active = false, rescan_again = false;
         // fix_console_slots' budget, for the current refresh, and the slots it nulled since the last log line
         std::chrono::steady_clock::time_point fix_start{};
         bool fix_over = false;
@@ -3409,18 +3412,51 @@ struct DeviceState {
         heap.pages->for_each_copied([&](std::size_t offset, std::size_t bytes) { fix_console_slots(heap, offset, bytes); });
         const auto generation = released_backings.load(std::memory_order_acquire);
         const auto alias_generation = leonida::title_va_aliases().invalidations();
-        if (heap.resource_heap && (generation != heap.checked_generation || alias_generation != heap.alias_generation)) {
-            heap.alias_generation = alias_generation;
-            heap.checked_generation = generation;
-            // Even an unchanged title slot may name a buffer released since the last submission.
-            for (size_t at = 0; at + kDescriptorSize <= heap.bytes; at += kDescriptorSize) {
-                auto* w = reinterpret_cast<uint32_t*>(heap.copy + at);
-                if (!(w[3] >> 30) && (w[2] || w[6])) {
-                    const auto slot = at / kDescriptorSize;
-                    if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
-                        heap.retry[slot] = 1;
-                        heap.retries.push_back(uint32_t(slot));
+        if (heap.resource_heap) {
+            // Even an unchanged title slot may name a buffer released since the last submission. Walking the whole heap
+            // (about 870,000 slots) at every change cost up to 1.2 s a submission during the story load, so the walk
+            // is done in slices of at most LEONIDA_CONSOLE_RESCAN_US (2000 by default, 0: the whole heap at once). A
+            // change that comes during a walk starts another when it ends.
+            static const std::uint64_t rescan_us = [] {
+                char text[16] = {};
+                const DWORD n = GetEnvironmentVariableA("LEONIDA_CONSOLE_RESCAN_US", text, sizeof(text));
+                return n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 2000ull;
+            }();
+            if (generation != heap.checked_generation || alias_generation != heap.alias_generation) {
+                heap.alias_generation = alias_generation;
+                heap.checked_generation = generation;
+                if (!rescan_us || !heap.rescan_active) {
+                    heap.rescan_active = true;
+                    heap.rescan_at = 0;
+                } else {
+                    heap.rescan_again = true;
+                }
+            }
+            if (heap.rescan_active) {
+                const auto scan_start = clock::now();
+                size_t at = heap.rescan_at;
+                bool finished = true;
+                for (std::uint32_t n = 0; at + kDescriptorSize <= heap.bytes; at += kDescriptorSize) {
+                    auto* w = reinterpret_cast<uint32_t*>(heap.copy + at);
+                    if (!(w[3] >> 30) && (w[2] || w[6])) {
+                        const auto slot = at / kDescriptorSize;
+                        if (!fix_console_slot(heap, slot) && !heap.retry[slot]) {
+                            heap.retry[slot] = 1;
+                            heap.retries.push_back(uint32_t(slot));
+                        }
                     }
+                    if (rescan_us && !(++n & 255) &&
+                        clock::now() - scan_start >= std::chrono::microseconds(rescan_us)) {
+                        at += kDescriptorSize;
+                        finished = at + kDescriptorSize > heap.bytes;
+                        break;
+                    }
+                }
+                heap.rescan_at = at;
+                if (finished) {
+                    heap.rescan_at = 0;
+                    heap.rescan_active = heap.rescan_again;
+                    heap.rescan_again = false;
                 }
             }
         }
