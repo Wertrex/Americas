@@ -1105,6 +1105,48 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect, MapOwner owner) {
     return true;
 }
 
+// With g_phys_mutex held. Maps `count` consecutive physical pages, `first_page` on, at the 64 KiB-aligned `address` in
+// one view. The caller has found the window and checked that the pages are consecutive in one section (map_run_length).
+// The story load calls CopyPageMappingsBatchX for long ranges, and one unmap and one MapViewOfFile3 per 64 KiB page
+// made the title's thread spend about 70% of its time here.
+bool map_pages(uintptr_t address, uint64_t first_page, uint64_t count, DWORD protect, MapOwner owner) {
+    const auto backing = g_pages.find(first_page);
+    if (backing == g_pages.end() || !count) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    {
+        const FaultLockExclusive lock;
+        if (!unmap_range_locked(address, address + count * kPhysicalPageSize)) return false;
+        fault_race_point(rt::xmem::kRemapBetween);
+        if (!map_view(address, View{count, backing->second.section, backing->second.offset, protect, false, false, owner}))
+            return false;
+    }
+    for (uint64_t k = 0; k < count; ++k) {
+        g_mapped[address + k * kPhysicalPageSize] = first_page + k;
+        note_mapping(first_page + k, address + k * kPhysicalPageSize, true);
+    }
+    return true;
+}
+
+// How many pages from `at` on (at most `limit`) map as one run: the physical pages of `found` are consecutive numbers
+// and sit one after the other in the same section.
+uint64_t map_run_length(const std::vector<uint64_t>& found, uint64_t at, uint64_t limit) {
+    const uint64_t page = found[static_cast<size_t>(at)];
+    if (!page) return 1;
+    const auto first = g_pages.find(page);
+    if (first == g_pages.end()) return 1;
+    uint64_t run = 1;
+    while (at + run < found.size() && run < limit && found[static_cast<size_t>(at + run)] == page + run) {
+        const auto next = g_pages.find(page + run);
+        if (next == g_pages.end() || next->second.section != first->second.section ||
+            next->second.offset != first->second.offset + run * kPhysicalPageSize)
+            break;
+        ++run;
+    }
+    return run;
+}
+
 bool on_wine() {
     static const bool wine = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version") != nullptr;
     return wine;
@@ -2017,10 +2059,23 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
     }
     const DWORD protect = view_protect(*window);
     const DWORD cpu_protect = cpu_window ? view_protect(*cpu_window) : 0;
-    for (uint64_t i = 0; i < pages; ++i) {
+    static const bool bulk = [] {
+        char v[2]{};
+        return GetEnvironmentVariableA("LEONIDA_XMEM_BULK_MAP", v, sizeof v) != 1 || v[0] != '0';
+    }();
+    for (uint64_t i = 0; i < pages;) {
         const uint64_t page = found[static_cast<size_t>(i)];
+        const uint64_t run = bulk ? map_run_length(found, i, kMaxViewPages) : 1;
+        if (run > 1) {
+            if (!map_pages(to + i * kPhysicalPageSize, page, run, protect, MapOwner::slot31)) return false;
+            if (cpu_window && !map_pages(cpu_to + i * kPhysicalPageSize, page, run, cpu_protect, MapOwner::mirror))
+                return false;
+            i += run;
+            continue;
+        }
         if (!map_page(to + i * kPhysicalPageSize, page, protect, MapOwner::slot31)) return false;
         if (cpu_window && !map_page(cpu_to + i * kPhysicalPageSize, page, cpu_protect, MapOwner::mirror)) return false;
+        ++i;
     }
     return true;
 }

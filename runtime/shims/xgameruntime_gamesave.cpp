@@ -626,6 +626,18 @@ HRESULT CALLBACK job_provider(XAsyncOp op, const XAsyncProviderData* data) {
     case XAsyncOp::DoWork: {
         size_t size = 0;
         const HRESULT hr = do_work(*job, size);
+        {
+            // Every failure, and the first few results of each kind, so a failed autosave can be read from the log.
+            const char* what = job->identity == &kInitIdentity ? "InitializeProvider" :
+                               job->identity == &kQuotaIdentity ? "GetRemainingQuota" :
+                               job->identity == &kDeleteIdentity ? "DeleteContainer" :
+                               job->identity == &kReadIdentity ? "ReadBlobData" :
+                               job->identity == &kSubmitIdentity ? "SubmitUpdate" :
+                               job->identity == &kFolderIdentity ? "GetFolder" : "?";
+            static std::atomic<unsigned> shown{0};
+            if (FAILED(hr) || shown.fetch_add(1, std::memory_order_relaxed) < 40)
+                std::fprintf(stderr, "[rt] xgamesave: %s -> 0x%08lx\n", what, static_cast<unsigned long>(hr));
+        }
         XAsyncComplete(data->async, hr, SUCCEEDED(hr) ? size : 0);
         return S_OK;
     }

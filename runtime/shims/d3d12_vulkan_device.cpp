@@ -11010,6 +11010,29 @@ public:
             std::lock_guard lock(exit_cache_mutex);
             exit_cache_devices.push_back(&state_);
         }
+        // LEONIDA_PIPELINE_CACHE_SAVE_S=<seconds>: also write the session pipeline cache while the title runs. A story load
+        // compiles for tens of minutes and a title that is busy or does not answer a close never reaches the exit save,
+        // so everything it compiled was lost (a 22-minute run left a 2 MB file).
+        static std::once_flag periodic_cache_once;
+        std::call_once(periodic_cache_once, [] {
+            char text[16] = {};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_PIPELINE_CACHE_SAVE_S", text, sizeof(text));
+            const unsigned long seconds = n > 0 && n < sizeof(text) ? std::strtoul(text, nullptr, 10) : 0ul;
+            if (!seconds) return;
+            std::thread([seconds] {
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+                    if (exit_cache_saved.load()) return;
+                    std::unique_lock lock(exit_cache_mutex, std::defer_lock);
+                    if (!lock.try_lock_for(std::chrono::milliseconds(500))) continue;
+                    for (DeviceState* d : exit_cache_devices) {
+                        if (!d->context || !d->pipeline_cache_handle) continue;
+                        save_session_pipeline_cache(d->context->vk, d->info.device, d->pipeline_cache_handle, false,
+                                                    "periodic");
+                    }
+                }
+            }).detach();
+        });
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
         copy_users_.resize(info.copy_queues.size(), 0);
