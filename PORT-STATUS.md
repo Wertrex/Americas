@@ -5,7 +5,8 @@ page; GPLv3, credits in [README.md](README.md) and [LICENSE](LICENSE)). It conta
 or shaders**, and it does not explain how to obtain them. You need your own copy of the Xbox Series package, version 1.0.2.1, as plain files on disk. See
 [README.md](README.md) for the build and [AGENTS.md](AGENTS.md) for the repository rules.
 
-**Status: early. Not playable.** The game starts and reaches its first-run screens. It does not reach the open world.
+**Status: early. Not playable.** The game starts, passes the story load and plays the opening of the story (the studio
+cards and the first title text) at about 1 frame/s. It does not reach the open world yet.
 
 ## What is different from upstream
 
@@ -31,7 +32,7 @@ Windows 11, RTX 5070, Ryzen 9 9950X3D, `LEONIDA_D3D12=vulkan`, `--first-run-ui`,
 | Frame rate on the first-run screens | About 25 frames/s, steady |
 | Story load, console-heap phase | 150 to 1,250 ms per submission before, about 6 ms after (max 8 to 13 ms) |
 | Story load, overall | 4 to 15 frames/s; the shadow-buffer copy (about 27 ms) and texture refresh (about 32 ms) per submission are next |
-| World start | **Fails.** `VK_ERROR_DEVICE_LOST` (invalid read of a pointer the title does not own), between about 76 and 140 s of run time, or the title's own 300 s watchdog abort |
+| World start | **Not reached.** The story opening plays at about 1 frame/s; no 3D world frame yet |
 
 Raising `LEONIDA_TITLE_WINDOWS_MB` from 64 to 512 moves the failure later but does not remove it: the 64 MiB cap was
 reached before the loss (`MiB copied so far: 63`), and with 512 the log reports 511. The cause is not fully pinned
@@ -76,24 +77,30 @@ A small diagnostic was added: the device-fault report now queries the faulting a
 
 ## GPU-loss investigation (26 November 2026)
 
-With NVIDIA Nsight Aftermath the runtime now names the shader and the instruction behind each `VK_ERROR_DEVICE_LOST`
-(`LEONIDA_AFTERMATH=1`, `LEONIDA_AFTERMATH_KEEP_SPIRV=1`; the SDK is not part of the repository). Findings, from about
+With NVIDIA Nsight Aftermath the runtime names the shader and the instruction behind each `VK_ERROR_DEVICE_LOST`
+(`LEONIDA_AFTERMATH=1`, `LEONIDA_AFTERMATH_KEEP_SPIRV=1`; the SDK is not part of the repository). Result of about
 twenty runs on one machine:
 
-- It is **not one shader and not only compute**: the faulting shader differed run to run (vertex and compute programs
-  alike), always an invalid read or write through a buffer descriptor (V#) whose base is garbage, so `heap_base + base`
-  names memory no resource owns. Skipping compute programs (`LEONIDA_SKIP_COMPUTE`) only changes which one faults.
-- The faulting address is often the same value in different runs (for example `0x513ad3235000` in two runs), so it is
-  data, not noise. Where that data comes from is **not found yet**.
-- Not the cause: arena block reuse (`LEONIDA_ARENA_NO_REUSE`, a local diagnostic), the sliced console-heap rescan,
-  `LEONIDA_ARENA_NULL_MB`, mesh draws (already skipped).
-- One real hole found and closed: per-draw V# tables that the title builds in its own memory, mirrored in the arena but
-  outside every registered descriptor heap, were never rebased (`scan_title_table` returned early). They are now fixed in
-  place (`LEONIDA_ARENA_TABLE_FIX=0` turns it off). The GPU is still lost afterwards, so this was one of several causes.
-- New diagnostics in the device-fault report: the faulting address as a title address and as `heap_base` + VA, and
-  the history of registered GPU backings around it.
+- The faulting shader differed run to run (vertex and compute programs alike), always an invalid read or write through a
+  buffer descriptor (V#) whose base was garbage. Skipping compute programs (`LEONIDA_SKIP_COMPUTE`) only changed which
+  one faulted.
+- **The cause was stale descriptor data, made worse by the speed settings used earlier the same day.**
+  `LEONIDA_REFRESH_PER_FRAME`, `LEONIDA_SHADOW_ALIAS_MS` set high and the asynchronous fills let a shader read a table or
+  descriptor that the title had already rewritten. With every shadow refreshed at each submission, the loss went away.
+  The earlier statement in this file that the faulting address was "a pointer the title does not own" described the
+  symptom, not the cause.
+- One real hole was also closed: per-draw V# tables that the title builds in its own memory, mirrored in the arena but
+  outside every registered descriptor heap, were never rebased (`scan_title_table` returned early). They are now fixed
+  in place (`LEONIDA_ARENA_TABLE_FIX=0` turns it off).
+- New diagnostics in the device-fault report: the faulting address as a title address and as `heap_base` + VA, and the
+  history of registered GPU backings around it.
 
-The world start still fails. Nothing here changes the status above.
+Settings that reach the story without losing the GPU (run for 300 s and more): asynchronous pipeline builds
+(`LEONIDA_ASYNC_PIPELINES=1`, `LEONIDA_PIPELINE_THREADS=12`), `LEONIDA_TITLE_FILL_ASYNC=1`,
+`LEONIDA_GEOMETRY_ASYNC=1`, `LEONIDA_TITLE_TEXTURE_PERIOD_MS=100`, `LEONIDA_SHADOW_ALIAS_MS=250`, and
+`LEONIDA_SKIP_COMPUTE` for eight compute programs. Do **not** set `LEONIDA_REFRESH_PER_FRAME`. Rate in that scene: about
+1 frame/s, with about 35 submissions per frame costing about 30 ms each (console heaps 9 ms, textures 15 ms, shadows
+5 ms). The skipped compute programs are a workaround for earlier faults and are probably not all needed any more.
 
 ## Not claimed
 
