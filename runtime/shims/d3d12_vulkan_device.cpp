@@ -95,6 +95,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include "../src/vulkan_memory_priority.h"
 #include <thread>
 #include <new>
 #include <optional>
@@ -2273,6 +2274,23 @@ struct DeviceState {
                      kib(ShadowPages::Copy::guarded), kib(ShadowPages::Copy::unguarded), kib(ShadowPages::Copy::aliased),
                      kib(ShadowPages::Copy::pinned), kib(ShadowPages::Copy::read_only),
                      kib(ShadowPages::Copy::copy_on_write), kib(ShadowPages::Copy::write_watched));
+        if (image_memory) {
+            // LOCAL DIAGNOSTIC: what holds the device memory. Images of the title's textures live in pooled blocks.
+            const auto pool = image_memory->stats();
+            std::uint64_t arena_live = 0;
+            {
+                std::lock_guard arena_lock(arena.mutex);
+                arena_live = arena.in_use;
+            }
+            std::fprintf(stderr,
+                         "[rt] d3d12: device memory: title image pool %llu blocks, %llu MiB, %llu images; arena %llu of %llu "
+                         "MiB in use; title windows %llu MiB\n",
+                         static_cast<unsigned long long>(pool.blocks), static_cast<unsigned long long>(pool.block_bytes >> 20),
+                         static_cast<unsigned long long>(pool.ranges), static_cast<unsigned long long>(arena_live >> 20),
+                         static_cast<unsigned long long>(arena.size >> 20),
+                         static_cast<unsigned long long>(title_window_bytes >> 20));
+        }
+        leonida::vram::report();
         shadow_copy_bytes = {};
         shadow_logged = shadow_submissions;
         shadow_log_time = now;
@@ -5068,6 +5086,12 @@ struct DeviceState {
                 dedicated.image = dedicated_image;
                 dedicated.pNext = allocate.pNext;
                 allocate.pNext = &dedicated;
+            }
+            VkMemoryPriorityAllocateInfoEXT priority{VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT};
+            if (leonida::memory_priority_enabled().load(std::memory_order_relaxed)) {
+                priority.priority = dedicated_image ? leonida::kPriorityRenderImages : leonida::kPriorityBuffers;
+                priority.pNext = allocate.pNext;
+                allocate.pNext = &priority;
             }
             allocate.allocationSize = requirements.size;
             allocate.memoryTypeIndex = i;
@@ -11266,6 +11290,9 @@ public:
                 VkMemoryAllocateInfo block{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
                 block.allocationSize = bytes;
                 block.memoryTypeIndex = type;
+                VkMemoryPriorityAllocateInfoEXT priority{VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT, nullptr,
+                                                         leonida::kPriorityTextureBlocks};
+                if (leonida::memory_priority_enabled().load(std::memory_order_relaxed)) block.pNext = &priority;
                 VkDeviceMemory out = VK_NULL_HANDLE;
                 return make(device, &block, nullptr, &out) == VK_SUCCESS ? out : VkDeviceMemory(VK_NULL_HANDLE);
             },
@@ -18722,6 +18749,24 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         std::fprintf(stderr, "[rt] d3d12: no VK_EXT_robustness2 nullDescriptor; stores through null UAVs land in "
                              "storage fallback images instead of being dropped\n");
 
+    // VK_EXT_memory_priority: see src/vulkan_memory_priority.h.
+    VkPhysicalDeviceMemoryPriorityFeaturesEXT memory_priority_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT};
+    bool want_memory_priority = false;
+    if (leonida::memory_priority_wanted() &&
+        std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceMemoryPriorityFeaturesEXT supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &supported};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        if (supported.memoryPriority) {
+            memory_priority_features.memoryPriority = VK_TRUE;
+            memory_priority_features.pNext = *v13.next();
+            *v13.next() = &memory_priority_features;
+            want_memory_priority = true;
+        }
+    }
     // Optional: VK_EXT_external_memory_host lets OpenExistingHeapFromAddress import the caller's committed memory as
     // the heap's backing, so the GPU reads what the CPU writes there without a copy.
     if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
@@ -18786,6 +18831,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.null_descriptor || info.robust_index_view) device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    if (want_memory_priority) {
+        device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+        leonida::memory_priority_enabled().store(true, std::memory_order_relaxed);
+        std::fprintf(stderr, "[rt] d3d12: VK_EXT_memory_priority on: buffers 1.0, render images 0.8, title texture blocks 0.1\n");
+    }
     leonida::DeviceFaultFeatures fault_features;
     const bool aftermath = leonida::aftermath::enable();  // already on, before the instance: see above
     char device_fault[2]{};

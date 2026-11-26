@@ -1,5 +1,6 @@
 #pragma once
 #include "vulkan_gpu_labels.h"
+#include "vulkan_vram_account.h"
 
 // The execution side of the D3D12 layer, without COM: the per-device Vulkan context (resources, layout tracker,
 // image views), queues that execute command lists, and timeline-semaphore fences. The COM objects in
@@ -144,6 +145,7 @@ struct VulkanDeviceFunctions {
 #define LEONIDA_VK_LOAD(name) name = reinterpret_cast<PFN_##name>(leonida::device_proc_or_khr(get, device, #name));
         LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_LOAD)
 #undef LEONIDA_VK_LOAD
+        leonida::vram::install(vkAllocateMemory, vkFreeMemory);  // LEONIDA_VRAM_ACCOUNT=1: counts the allocations
         return vkCreateCommandPool && vkDestroyCommandPool && vkAllocateCommandBuffers && vkResetCommandBuffer &&
                vkBeginCommandBuffer && vkEndCommandBuffer && vkQueueSubmit && vkQueueWaitIdle && vkCreateSemaphore &&
                vkDestroySemaphore && vkGetSemaphoreCounterValue && vkWaitSemaphores && vkSignalSemaphore &&

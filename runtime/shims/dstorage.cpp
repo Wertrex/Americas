@@ -1135,7 +1135,23 @@ private:
             const char* failure = nullptr;
             const auto quality = leonida::bcpack::decode(bc, data, scratch, allow_fitted, bc >= 6 ? bcpack_history() : nullptr, &failure, fast_entropy);
             e.timing.bcpack = Timing::elapsed(begin);
-            if (quality == leonida::bcpack::Quality::failed) { e.reason = failure; return E_DSTORAGE_DECOMPRESSION_ERROR; }
+            if (quality == leonida::bcpack::Quality::failed) {
+                // A BCPack stream whose block predictor is not in the local history (BC7 "missing-endpoint": the
+                // impostor atlases) cannot be rebuilt. An error leaves the destination unwritten and the title went on to
+                // read it (an access violation 4 to 23 s later, twice in a row). With LEONIDA_DSTORAGE_LENIENT unset
+                // or 1 the request succeeds with zero blocks (invalid BC7 and black BC1: transparent or black texels), so
+                // only those textures look wrong. LEONIDA_DSTORAGE_LENIENT=0 returns the error again.
+                static const bool lenient = [] {
+                    char v[2]{};
+                    return GetEnvironmentVariableA("LEONIDA_DSTORAGE_LENIENT", v, sizeof v) != 1 || v[0] != '0';
+                }();
+                if (!lenient) { e.reason = failure; return E_DSTORAGE_DECOMPRESSION_ERROR; }
+                static std::atomic<unsigned> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 8)
+                    std::fprintf(stderr, "[rt] dstorage: bc=%u request of %u bytes (%s) written as zero blocks instead of failing\n",
+                                 bc, r.DestinationSize, failure ? failure : "no reason");
+                std::fill(scratch.begin(), scratch.end(), std::uint8_t{0});
+            }
             if (quality == leonida::bcpack::Quality::fitted) {
                 static const bool reported = (log_once("fitted", "using fitted BCPack predictors"), true);
                 (void)reported;
