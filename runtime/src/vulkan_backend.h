@@ -1763,6 +1763,26 @@ public:
     // Set once, before the first queue exists.
     void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
 
+    // Queues that batch their ExecuteCommandLists (LEONIDA_COALESCE_LISTS) register a function that submits what they
+    // hold; a present calls flush_queues() first so what it shows is after the work submitted before it.
+    void add_queue_flusher(const void* key, std::function<void()> flush) {
+        std::lock_guard lock(flushers_mutex_);
+        flushers_.emplace_back(key, std::move(flush));
+    }
+    void remove_queue_flusher(const void* key) {
+        std::lock_guard lock(flushers_mutex_);
+        flushers_.erase(std::remove_if(flushers_.begin(), flushers_.end(), [&](const auto& f) { return f.first == key; }),
+                        flushers_.end());
+    }
+    void flush_queues() {
+        std::vector<std::function<void()>> flushers;
+        {
+            std::lock_guard lock(flushers_mutex_);
+            for (const auto& f : flushers_) flushers.push_back(f.second);
+        }
+        for (const auto& f : flushers) f();
+    }
+
     // Table VAs are offsets in this device's arena. Install its scanner before creating any queues.
     // (The per-device scan is from the patch descriptor-table-refresh, part 2, of
     // Sigtryggur-Mani-Gudmundsson/graphics-runtime-patches at d9a0bc1b, GPL-3.0.)
@@ -2233,6 +2253,8 @@ private:
         resolve_passes_;
     std::map<std::tuple<VkImage, VkImage, VkImageView, VkImageView, VkRenderPass>, VkFramebuffer> resolve_framebuffers_;
     std::function<void()> before_execute_;
+    std::mutex flushers_mutex_;
+    std::vector<std::pair<const void*, std::function<void()>>> flushers_;
     InputProbe input_probe_;
     TableScanner table_scanner_;
     GeometryProvider geometry_provider_;
@@ -2405,8 +2427,33 @@ public:
         type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
         ok_ = ok_ && vk.vkCreateSemaphore(context.device(), &info, nullptr, &progress_) == VK_SUCCESS;
+        if (kind == QueueKind::direct || kind == QueueKind::compute) {
+            // LEONIDA_COALESCE_LISTS=N (0, the default: off): the lists of up to N consecutive ExecuteCommandLists on this
+            // queue are replayed and submitted together, with one refresh of the title's memory copies (before_execute)
+            // for all of them. A title frame in the story load is ~70 submissions, each paying the whole refresh (10-16 ms
+            // measured), which is what holds it at 1 fps. The batch is submitted, in queue order, at the next Signal, Wait,
+            // marker, tile mapping, idle, present, or after LEONIDA_COALESCE_US microseconds (4000 by default).
+            char text[16] = {};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_COALESCE_LISTS", text, sizeof(text));
+            coalesce_max_ = n > 0 && n < sizeof(text) ? std::size_t(std::strtoull(text, nullptr, 10)) : 0;
+            const DWORD m = GetEnvironmentVariableA("LEONIDA_COALESCE_US", text, sizeof(text));
+            coalesce_ns_ = (m > 0 && m < sizeof(text) ? std::int64_t(std::strtoull(text, nullptr, 10)) : 4000) * 1000;
+        }
         try {
             context_.holds().attach(this);
+            if (coalesce_max_) {
+                context_.add_queue_flusher(this, [this] { flush_coalesced(); });
+                timer_ = std::thread([this] {
+                    while (!timer_stop_.load(std::memory_order_acquire)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        if (coal_flag_.load(std::memory_order_acquire) &&
+                            std::chrono::steady_clock::now().time_since_epoch().count() -
+                                    coal_since_ns_.load(std::memory_order_relaxed) >=
+                                coalesce_ns_)
+                            flush_coalesced();
+                    }
+                });
+            }
         } catch (...) {
             // A failed registration leaves no queue to run the destructor for these Vulkan handles.
             if (progress_) vk.vkDestroySemaphore(context.device(), progress_, nullptr);
@@ -2417,6 +2464,12 @@ public:
 
     ~VulkanQueue() {
         auto& vk = context_.vk;
+        if (coalesce_max_) {
+            timer_stop_.store(true, std::memory_order_release);
+            if (timer_.joinable()) timer_.join();
+            context_.remove_queue_flusher(this);
+            flush_coalesced();
+        }
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
         context_.holds().pump_ready();  // presents queued behind what was just dropped can run
@@ -2467,6 +2520,7 @@ public:
     bool update_tiles(ResourceId id, std::span<const TileRegion> regions,
                       std::span<const TileRange> ranges, GetHeap&& get_heap) {
         std::lock_guard state(state_mutex_);  // outermost: held batches are released from other threads
+        flush_coalesced_locked();             // a mapping change comes after the work submitted before it
         std::unique_lock lock(context_.resource_mutex_);
         const auto it = context_.sparse_resources_.find(id);
         if (it == context_.sparse_resources_.end()) return false;
@@ -2514,6 +2568,7 @@ public:
     bool copy_tile_mappings(ResourceId dst, std::span<const TileRegion> dst_regions, ResourceId src,
                             std::span<const TileRegion> src_regions) {
         std::lock_guard state(state_mutex_);
+        flush_coalesced_locked();
         std::unique_lock lock(context_.resource_mutex_);
         const auto source = context_.sparse_resources_.find(src), target = context_.sparse_resources_.find(dst);
         if (source == context_.sparse_resources_.end() || target == context_.sparse_resources_.end() ||
@@ -2552,11 +2607,17 @@ public:
         std::vector<std::shared_ptr<void>> retired;  // destroyed after state_mutex_ is released
         {
             std::lock_guard state(state_mutex_);
-            if (!must_hold()) {
+            if (coalesce_max_ && !context_.is_device_lost() && !must_hold()) {
+                coalesce_add(lists, pin, execute_call);
+                if (coal_.lists.size() >= coalesce_max_) flush_coalesced_locked();
+            } else if (!must_hold()) {
+                flush_coalesced_locked();
                 result = execute_now(lists, execute_call);
             } else if (context_.is_device_lost()) {
+                flush_coalesced_locked();
                 result = queue_unsupported(__LINE__);
             } else {
+                flush_coalesced_locked();
                 Deferred op;
                 op.kind = Deferred::Kind::batch;
                 op.execute_call = execute_call;
@@ -2581,6 +2642,7 @@ public:
         std::vector<std::shared_ptr<void>> retired;
         {
             std::lock_guard state(state_mutex_);
+            flush_coalesced_locked();  // the fence reaches its value after the work submitted before the Signal
             if (must_hold()) {
                 Deferred op;
                 op.kind = Deferred::Kind::signal;
@@ -2605,6 +2667,7 @@ public:
         std::vector<std::shared_ptr<void>> retired;  // fences whose submission has completed: released unlocked
         {
             std::lock_guard state(state_mutex_);
+            flush_coalesced_locked();  // the Wait holds back later submissions only
             waits_.push_back(fence);
             wait_values_.push_back(value);
             if (pin) wait_pins_.push_back(pin());
@@ -2624,6 +2687,7 @@ public:
     void marker(DebugMarker::Kind kind, const char* label) {
         std::vector<std::shared_ptr<void>> retired;
         std::lock_guard state(state_mutex_);
+        flush_coalesced_locked();
         drain_pins(retired);  // destroyed after the lock (reverse declaration order)
         if (!held_.empty()) {  // behind the held work, so behind it in the queue's labels too
             Deferred op;
@@ -2637,6 +2701,7 @@ public:
     }
 
     bool idle() {
+        flush_coalesced();
         std::lock_guard lock(context_.submit_mutex());
         return context_.observe_result(context_.vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle") == VK_SUCCESS;
     }
@@ -3583,6 +3648,62 @@ private:
         std::vector<std::shared_ptr<void>> wait_pins;  // the fences of `waits`
         std::chrono::steady_clock::time_point held_at{};  // LEONIDA_GPU_LATENCY: when it was held
     };
+
+    // ---- Batching of ExecuteCommandLists (LEONIDA_COALESCE_LISTS, see the constructor) ----
+    std::size_t coalesce_max_ = 0;
+    std::int64_t coalesce_ns_ = 4'000'000;
+    Deferred coal_;                  // the batch being gathered; state_mutex_
+    bool coal_active_ = false;       // likewise
+    std::atomic<bool> coal_flag_{false};
+    std::atomic<std::int64_t> coal_since_ns_{0};
+    std::atomic<bool> timer_stop_{false};
+    std::thread timer_;
+
+    // Adds the lists to the batch, which takes the waits pending now with it. state_mutex_ held, nothing held ahead.
+    void coalesce_add(std::span<const CommandList* const> lists, const PinFn& pin, std::uint64_t execute_call) {
+        if (!coal_active_) {
+            coal_ = Deferred{};
+            coal_.kind = Deferred::Kind::batch;
+            coal_.execute_call = execute_call;
+            coal_.waits = std::move(waits_);
+            coal_.wait_values = std::move(wait_values_);
+            coal_.wait_pins = std::move(wait_pins_);
+            waits_.clear();
+            wait_values_.clear();
+            wait_pins_.clear();
+            coal_active_ = true;
+            coal_since_ns_.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+            coal_flag_.store(true, std::memory_order_release);
+        }
+        for (const CommandList* list : lists) coal_.lists.push_back(*list);
+        if (pin) coal_.pins.push_back(pin());
+    }
+
+    // Submits the batch, in order with everything else on the queue. state_mutex_ held.
+    void flush_coalesced_locked() {
+        if (!coal_active_) return;
+        coal_active_ = false;
+        coal_flag_.store(false, std::memory_order_release);
+        Deferred op = std::move(coal_);
+        coal_ = Deferred{};
+        if (!context_.is_device_lost()) run(op);
+    }
+
+public:
+    // Submits the batch gathered so far (see LEONIDA_COALESCE_LISTS). Safe from any thread, with no lock held.
+    void flush_coalesced() {
+        if (!coalesce_max_) return;
+        std::vector<std::shared_ptr<void>> retired;
+        {
+            std::lock_guard state(state_mutex_);
+            flush_coalesced_locked();
+            drain_pins(retired);
+        }
+        retired.clear();
+        context_.holds().pump_ready();
+    }
+
+private:
 
     bool waits_pending(const std::vector<VkSemaphore>& semaphores, const std::vector<std::uint64_t>& values) const {
         for (std::size_t i = 0; i < semaphores.size(); ++i)

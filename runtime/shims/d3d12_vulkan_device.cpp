@@ -395,8 +395,12 @@ public:
 
     // Brings every target up to date with the pages. Returns the bytes copied into them. With copy_aliased false, pages
     // xmem maps at another address too are left as they are this time (DeviceState::refresh_shadows throttles them).
-    std::size_t refresh(bool copy_aliased = true) {
+    // slice: copy the aliased pages in slices (add_aliased_jobs). Only the slot-133 shadows and title windows do: the
+    // console descriptor heaps hold the V#s and T#s the GPU reads, which must never be a refresh behind.
+    std::size_t refresh(bool copy_aliased = true, bool slice = false) {
         copy_aliased_ = copy_aliased;
+        slice_aliased_ = slice;
+        if (copy_aliased) ++alias_phase_;
         jobs_.clear();
         zeroed_.clear();
         copy_bytes_ = {};
@@ -489,12 +493,15 @@ public:
             // the journal (kRequery) anyway. speed-16/17/18: 730-820 VirtualQuery calls a refresh, ~19 us each under
             // Wine (NtQueryVirtualMemory waits for Wine's virtual-memory lock, which the mapping threads hold), a
             // fifth of the submitting thread's time.
-            const auto skip = [&](std::uint8_t s) {
-                return unchanged(s) || (!copy_aliased_ && (s == kAliased || s == kZero || s == (kZero | kAliased)));
+            // Aliased pages outside this refresh's slice (add_aliased_jobs) are passed over the same way: measured 2,200
+            // VirtualQuery calls a refresh in the story load, most of them over pages no slice copy would have read.
+            const auto skip = [&](std::uint8_t s, std::size_t i) {
+                return unchanged(s) ||
+                       ((!copy_aliased_ || !in_alias_slice(i)) && (s == kAliased || s == kZero || s == (kZero | kAliased)));
             };
-            if (!full_walk && skip(state_[i0])) {
+            if (!full_walk && skip(state_[i0], i0)) {
                 std::size_t i = i0 + 1;
-                while (i < state_.size() && skip(state_[i])) ++i;
+                while (i < state_.size() && skip(state_[i], i)) ++i;
                 at = first_ + i * kPage;
                 continue;
             }
@@ -812,6 +819,40 @@ private:
             }
     }
 
+    // Pages xmem maps at two addresses cannot be watched, so every refresh that copies them copies all of them: after the
+    // story load that is 300 MiB or more at once, 100 ms of one submission (measured: 111 ms at most, 20 ms on average,
+    // the intro stutters). They are copied in slices instead: 1 MiB blocks of the title's pages, one slice in
+    // LEONIDA_SHADOW_ALIAS_SLICES (1 by default: all of them at every refresh; 8 was measured to lose the GPU) per refresh, rotating,
+    // so each page is copied at most that many refreshes behind the title's writes and no submission carries them all.
+    static std::size_t alias_slices() {
+        static const std::size_t slices = [] {
+            char text[16] = {};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_SHADOW_ALIAS_SLICES", text, sizeof(text));
+            const unsigned long long v = n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 1ull;
+            return std::size_t(v == 0 ? 1 : v);
+        }();
+        return slices;
+    }
+    bool in_alias_slice(std::size_t i) const {
+        const std::size_t slices = alias_slices();
+        return !slice_aliased_ || slices <= 1 || ((i + first_ / kPage) / 256) % slices == alias_phase_ % slices;
+    }
+    // Adds jobs for the part of aliased pages [i, j) that is this refresh's slice.
+    void add_aliased_jobs(std::size_t i, std::size_t j, bool streaming) {
+        const std::size_t slices = alias_slices();
+        if (!slice_aliased_ || slices <= 1) {
+            add_job(i, j, streaming, Copy::aliased);
+            return;
+        }
+        constexpr std::size_t kBlock = 256;  // pages of 4 KiB: 1 MiB
+        while (i < j) {
+            const std::size_t block = (i + (first_ / kPage)) / kBlock;
+            const std::size_t end = std::min(j, (block + 1) * kBlock - (first_ / kPage));
+            if (block % slices == alias_phase_ % slices) add_job(i, end, streaming, Copy::aliased);
+            i = end;
+        }
+    }
+
     // Guarded pages [i, j) of a read-write region (protection `current`): written since the last refresh, or newly
     // committed or mapped. Watched from now on, then copied.
     void guard_writable(std::size_t i0, std::size_t i1, DWORD current, bool streaming) {
@@ -825,10 +866,13 @@ private:
                 i = j;
                 continue;
             }
+            if (unwatched && (state_[i] & kAliased)) {
+                add_aliased_jobs(i, j, streaming);
+                i = j;
+                continue;
+            }
             add_job(i, j, streaming,
-                    !unwatched                    ? (watch_ && (state_[i] & kProtected) ? Copy::guarded : Copy::unguarded)
-                    : (state_[i] & kAliased) ? Copy::aliased
-                                             : Copy::pinned);
+                    !unwatched ? (watch_ && (state_[i] & kProtected) ? Copy::guarded : Copy::unguarded) : Copy::pinned);
             i = j;
         }
     }
@@ -842,10 +886,10 @@ private:
             while (j < i1 && ((state_[j] & (kProtected | kAliased | kPinned)) == kProtected) == clean) ++j;
             if (!clean && !(!copy_aliased_ && (state_[i] & kAliased))) {
                 for (std::size_t k = i; k < j; ++k) state_[k] &= ~kZero;
-                add_job(i, j, streaming,
-                        state_[i] & kAliased  ? Copy::aliased
-                        : state_[i] & kPinned ? Copy::pinned
-                                              : Copy::read_only);
+                if (state_[i] & kAliased)
+                    add_aliased_jobs(i, j, streaming);
+                else
+                    add_job(i, j, streaming, state_[i] & kPinned ? Copy::pinned : Copy::read_only);
             }
             i = j;
         }
@@ -1054,6 +1098,8 @@ private:
     DWORD protect_error_ = 0;  // a VirtualProtect refusal of this refresh(), logged after it
     std::array<std::uint64_t, unsigned(Copy::count)> copy_bytes_{};  // refresh() only, likewise
     bool copy_aliased_ = true;                                        // likewise
+    bool slice_aliased_ = false;                                      // likewise
+    std::size_t alias_phase_ = 0;                                     // likewise: which slice of the aliased pages this refresh copies
     std::uint64_t refresh_queries_ = 0;
     std::uint64_t refresh_protects_ = 0;  // VirtualProtect calls of the last refresh()
     bool refresh_walked_all_ = false;     // the last refresh() queried every page (the title memory map changed)
@@ -1073,6 +1119,21 @@ private:
 // The live ShadowPages of every device, for the fault handler. Never freed: a fault can come at any time. In host_heap,
 // like everything changed under g_shadow_pages_lock (see ShadowPages).
 SRWLOCK g_shadow_pages_lock = SRWLOCK_INIT;
+
+// LEONIDA_ADAPTIVE_THROTTLE=1: the delays of LEONIDA_SHADOW_ALIAS_MS and LEONIDA_TITLE_TEXTURE_PERIOD/CHECK_KB/FILL_MS
+// (the values of those variables) apply only while the copies are expensive (the story load: tens of MiB of aliased pages
+// a submission, 20 ms or more of a submission), and the defaults apply otherwise. Measured: the delays keep the story
+// from losing the GPU but leave the intro's images up to 250 ms behind (it stutters); without them the intro is smooth.
+// Set by DeviceState::refresh_shadows from the cost of the copies, with hysteresis.
+std::atomic<bool> g_throttle_heavy{false};
+inline bool adaptive_throttle_enabled() {
+    static const bool on = [] {
+        char text[8] = {};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_ADAPTIVE_THROTTLE", text, sizeof(text));
+        return n > 0 && text[0] == '1';
+    }();
+    return on;
+}
 leonida::host_heap::vector<ShadowPages*>& shadow_pages_list() {
     static auto* list = new leonida::host_heap::vector<ShadowPages*>;
     return *list;
@@ -2152,6 +2213,8 @@ struct DeviceState {
     std::uint64_t shadow_asks = 0;      // GetWriteWatch calls, likewise
     std::uint64_t shadow_written = 0;   // write-watched pages they found written, likewise
     std::array<std::uint64_t, unsigned(ShadowPages::Copy::count)> shadow_copy_bytes{};  // by cause, likewise
+    double shadow_cost_avg = 0.0;  // refresh_shadows, adaptive throttle
+    std::chrono::steady_clock::time_point shadow_heavy_since{};
     std::chrono::steady_clock::time_point shadow_alias_time{};  // the last refresh that copied aliased pages
     double shadow_ms = 0;               // spent since the last log line
     double shadow_max_ms = 0;           // the longest refresh since the last log line
@@ -2228,11 +2291,12 @@ struct DeviceState {
             const DWORD n = GetEnvironmentVariableA("LEONIDA_SHADOW_ALIAS_MS", text, sizeof(text));
             return n > 0 && n < sizeof(text) ? std::strtoull(text, nullptr, 10) : 0ull;
         }());
-        const bool copy_aliased = alias_period.count() == 0 || start - shadow_alias_time >= alias_period;
+        const bool delay_aliased = !adaptive_throttle_enabled() || g_throttle_heavy.load(std::memory_order_relaxed);
+        const bool copy_aliased = alias_period.count() == 0 || !delay_aliased || start - shadow_alias_time >= alias_period;
         if (copy_aliased) shadow_alias_time = start;
         std::uint64_t copied = 0;
         for (const ShadowPagesPtr& s : shadows) {
-            copied += s->refresh(copy_aliased);
+            copied += s->refresh(copy_aliased, true);
             shadow_queries += s->refresh_queries();
             shadow_protects += s->refresh_protects();
             shadow_walks += s->refresh_walked_all();
@@ -2244,6 +2308,21 @@ struct DeviceState {
         const double ms = std::chrono::duration<double, std::milli>(now - start).count();
         shadow_ms += ms;
         shadow_max_ms = std::max(shadow_max_ms, ms);
+        if (adaptive_throttle_enabled()) {
+            // A moving average of the refresh's cost: heavy above 10 ms, light again below 3 ms.
+            shadow_cost_avg = shadow_cost_avg * 0.9 + ms * 0.1;
+            const bool heavy = g_throttle_heavy.load(std::memory_order_relaxed);
+            // Once on, it stays on for at least two minutes: the delays themselves bring the cost down, and without the hold
+            // it flapped (measured: dozens of on/off changes in a minute, leaving the story mostly unthrottled).
+            if (!heavy && shadow_cost_avg > 10.0) {
+                shadow_heavy_since = now;
+                g_throttle_heavy.store(true, std::memory_order_relaxed);
+                std::fprintf(stderr, "[rt] d3d12: adaptive throttle on (shadow refresh %.1f ms on average)\n", shadow_cost_avg);
+            } else if (heavy && shadow_cost_avg < 3.0 && now - shadow_heavy_since > std::chrono::seconds(120)) {
+                g_throttle_heavy.store(false, std::memory_order_relaxed);
+                std::fprintf(stderr, "[rt] d3d12: adaptive throttle off (shadow refresh %.1f ms on average)\n", shadow_cost_avg);
+            }
+        }
         shadow_bytes += copied;
         ++shadow_submissions;
         if (shadow_submissions != 1 && now - shadow_log_time < std::chrono::seconds(5)) return;
@@ -3555,8 +3634,17 @@ struct DeviceState {
             std::memcpy(heap.copy + offset, heap.input + offset, end - offset);
             return;
         }
+        // Most of a heap is unchanged between two submissions (measured in the story load: 27 MiB copied a submission,
+        // 6 ms spent finding the few slots that differ with 880,000 memcmp calls of 32 bytes). A 4 KiB block that
+        // compares equal is passed over whole; one that differs is walked slot by slot as before, so what is fixed is the same.
+        constexpr std::size_t kBlockBytes = 4096;
         for (std::size_t at = offset & ~std::size_t(kDescriptorSize - 1); at + kDescriptorSize <= end;
              at += kDescriptorSize) {
+            if (!(at & (kBlockBytes - 1)) && at + kBlockBytes <= end &&
+                !std::memcmp(heap.previous + at, heap.input + at, kBlockBytes)) {
+                at += kBlockBytes - kDescriptorSize;
+                continue;
+            }
             const std::size_t slot = at / kDescriptorSize;
             if (!std::memcmp(heap.previous + at, heap.input + at, kDescriptorSize)) continue;
             std::memcpy(heap.previous + at, heap.input + at, kDescriptorSize);
@@ -12301,11 +12389,16 @@ public:
             size_t length = 0;
             return getenv_s(&length, text, name) == 0 && length > 1 ? std::strtoull(text, nullptr, 10) : fallback;
         };
-        static const auto period = std::chrono::milliseconds(setting("LEONIDA_TITLE_TEXTURE_PERIOD_MS", 16));
-        static const std::uint64_t check_budget = setting("LEONIDA_TITLE_TEXTURE_CHECK_KB", 4096) << 10;
+        static const auto period_set = std::chrono::milliseconds(setting("LEONIDA_TITLE_TEXTURE_PERIOD_MS", 16));
+        static const std::uint64_t check_set = setting("LEONIDA_TITLE_TEXTURE_CHECK_KB", 4096) << 10;
         static const std::uint64_t fill_budget = setting("LEONIDA_TITLE_TEXTURE_FILL_MB", 32) << 20;
         // And at most this long filling a pass (0: no limit); a texture already started is finished.
-        static const std::uint64_t fill_budget_ns = setting("LEONIDA_TITLE_TEXTURE_FILL_MS", 8) * 1000000;
+        static const std::uint64_t fill_ns_set = setting("LEONIDA_TITLE_TEXTURE_FILL_MS", 8) * 1000000;
+        // With LEONIDA_ADAPTIVE_THROTTLE the variables above are the heavy-load values (see g_throttle_heavy).
+        const bool light = adaptive_throttle_enabled() && !g_throttle_heavy.load(std::memory_order_relaxed);
+        const auto period = light ? std::chrono::milliseconds(16) : period_set;
+        const std::uint64_t check_budget = light ? (std::uint64_t(4096) << 10) : check_set;
+        const std::uint64_t fill_budget_ns = light ? std::uint64_t(8) * 1000000 : fill_ns_set;
         // Stop the background sweep at a texture boundary. Zero keeps the byte budget alone.
         static const std::uint64_t hash_budget_us = setting("LEONIDA_TEXTURE_HASH_BUDGET_US", 400);
         // Residency checks and uploads also cost time. Limit background work between textures;
@@ -12421,11 +12514,28 @@ public:
         }
         const auto every_start = clock::now();
         stats.written_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(every_start - now).count();
-        for (const auto& entry : entries)
-            if (entry.second->mapped || entry.second->stale) {
-                ++stats.every_pass_visits;
-                visit(*entry.second);
+        // The mapped and stale textures are visited in address order from where the last pass stopped, for at most
+        // LEONIDA_TITLE_EVERY_BUDGET_MS (6 by default; 0 visits all every pass, as before). During the story load there
+        // are some 23,000 of them and the full visit took 53 ms a pass (measured), on every submission's path; with the
+        // budget each one still comes up within a few passes, and a pass over a small set (the intro) is not cut.
+        static const auto every_budget = std::chrono::microseconds(setting("LEONIDA_TITLE_EVERY_BUDGET_MS", 6) * 1000);
+        if (!entries.empty()) {
+            auto index = std::size_t(std::lower_bound(entries.begin(), entries.end(), title_every_cursor_,
+                                                      [](const auto& entry, std::uint64_t at) { return entry.first < at; }) -
+                                     entries.begin());
+            if (index >= entries.size()) index = 0;
+            std::size_t looked = 0;
+            for (auto left = entries.size(); left; --left) {
+                const auto& entry = entries[index];
+                title_every_cursor_ = entry.first + 1;
+                if (entry.second->mapped || entry.second->stale) {
+                    ++stats.every_pass_visits;
+                    visit(*entry.second);
+                    if (every_budget.count() && !(++looked & 15) && clock::now() - every_start >= every_budget) break;
+                }
+                index = index + 1 == entries.size() ? 0 : index + 1;
             }
+        }
         stats.every_pass_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - every_start).count();
         // The budget is the round robin's: mapped and stale textures above are checked every pass whatever it is.
         const auto first_bytes = checked, first_hash_ns = stats.hash_ns;
@@ -12689,6 +12799,7 @@ private:
         }
         geometry_refresher_->wake.notify_one();
     }
+    std::uint64_t title_every_cursor_ = 0;                         // under title_texture_mutex: where the mapped/stale visit resumes
     std::uint64_t title_refresh_cursor_ = 0;                       // under title_texture_mutex
     std::uint64_t title_map_generation_ = 0;                       // likewise: the map changes the passes have seen
     std::chrono::steady_clock::time_point title_retry_all_{};      // likewise

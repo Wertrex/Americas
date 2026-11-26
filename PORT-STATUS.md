@@ -5,10 +5,12 @@ page; GPLv3, credits in [README.md](README.md) and [LICENSE](LICENSE)). It conta
 or shaders**, and it does not explain how to obtain them. You need your own copy of the Xbox Series package, version 1.0.2.1, as plain files on disk. See
 [README.md](README.md) for the build and [AGENTS.md](AGENTS.md) for the repository rules.
 
-**Status: early. Not playable.** The game starts, passes the story load and plays the opening of the story (the studio
-cards and the first title text) at about 1 frame/s, with a black background behind the text and no sound. It does not
-reach the open world yet. The limits measured so far are video memory (about 14 GB wanted on a 12 GB card), the cost of
-every submission (about 18 ms, about 56 submissions a frame) and the early exits described below.
+**Status: early. Not playable, but the game loads.** On a Windows PC with an RTX 5070 the title boots, runs its menus and the first-run
+setup, passes the story load (the console's own loading screens, then the story) and plays the opening of the story: the title animation,
+the studio cards and credits, at about 29 frames a second in the intro and about 0.4 to 1 frame a second once the story load is under way, with a
+black background behind the credits and no sound. It does not reach the open world yet. The limits measured so far are video memory (about
+14 GB wanted on a 12 GB card), the cost of every submission (10 to 16 ms, 50 to 70 submissions a frame in the story) and the early exits
+described below. A recent section compares this with the other public ports and what was tried on top of it.
 
 ## What is different from upstream
 
@@ -143,6 +145,40 @@ pure-Python RDNA2 decoder when `llvm-mc` leaves invalid words and the decoder le
 translate and pass `spirv-val`. Rebuild the `shaders` stage to pick it up. Effect on the title is being measured; the
 Series S profile (`LEONIDA_DEVICE_TYPE=6`, 1080p internal, about 3 GB less video memory at the same point) used to end at
 61 s inside the upscaler DLL and now runs for several minutes.
+
+## Intro pacing, story throughput and the other ports (26 November 2026, morning)
+
+Measured on an RTX 5070 (12 GB), 9950X3D, 61 GB of RAM, Series X profile, with the window captured at 30 frames a second.
+
+**The intro stutter was ours.** The title's opening animation (about 19 s) presented 21 new images a second, with freezes of 0.4 to 1.8 s
+inside it. The cause was the delays the story needed (`LEONIDA_SHADOW_ALIAS_MS=250`, `LEONIDA_TITLE_TEXTURE_PERIOD_MS=250`, a smaller
+`LEONIDA_TITLE_TEXTURE_FILL_MS`): they leave what the title writes up to 250 ms behind. Without them the intro runs nearly smooth.
+`LEONIDA_ADAPTIVE_THROTTLE=1` now applies those four values only while the shadow refresh costs more than 10 ms on average (the story load)
+and keeps them for at least two minutes (without the hold it flapped on and off dozens of times a minute).
+
+**The story still runs at 0.4 to 1 frame a second.** About 50 to 70 submissions per title frame, each paying a refresh of 10 to 16 ms of
+CPU: the console descriptor heap copies 27 MiB of aliased pages at every submission and about 4,700 slots a submission change (more than half of
+them are plain data, not descriptors), each fixed eagerly. Changes that went in: the 27 MiB heap is compared in 4 KiB blocks before walking
+its slots, the mapped-and-stale texture visit is limited to 6 ms a pass (`LEONIDA_TITLE_EVERY_BUDGET_MS`, it visited about 23,000 textures
+and took 53 ms), and `VirtualQuery` is skipped over aliased pages outside the refresh's slice.
+
+**Tried and left off by default**
+- `LEONIDA_SHADOW_ALIAS_SLICES=N` copies the aliased pages of the slot-133 shadows in N rotating slices. With 8 the device was lost in a compute
+  dispatch; the default is 1 (all, as before). The console descriptor heaps are never sliced: the GPU reads the V#s and T#s in them.
+- `LEONIDA_COALESCE_LISTS=N` joins the lists of up to N consecutive `ExecuteCommandLists` of a queue into one replay and one refresh, flushed at a
+  Signal, Wait, marker, tile mapping, idle, present or after `LEONIDA_COALESCE_US`. It is the change that would cut the per-submission cost, but
+  the device was lost in 2 of 3 runs (a hang in a joined batch). Off by default (0).
+
+**Launcher fact worth knowing:** a run executes `scratch\port\gta6rt.exe`, not the build folder's binary. Copy it after building, or the
+change is not tested (several runs this morning measured the old binary).
+
+**Other ports.** Public tracking (PortWatch, tracker data of 26 November) lists builds that play the opening hours at 3 to 16 frames a second,
+all built on VIctory (a Rust layer with a native Direct3D 12 backend, not this project): the fastest public one reports about 16 fps on a Radeon RX
+7900 XTX with 24 GB of video memory. `leonida-ce`, the other continuation of this project, stops at the GPU loss after the legal terms.
+I ran the 7900XTX fork on this machine with the user's own copy: the real 3D intro cutscene renders with sound, at 1 to 2 fps with its defaults
+and 5 to 10 with `VICTORY_TEXTURE_BUDGET_MB=2000` (the card stops sitting at its memory limit). Its panel shows most draws dropped for lack of a
+host pipeline on a 32-lane GPU, which is the cause of its lighting and texture faults; resolution, the Series S profile (black) and precompiled
+pipelines did not help. Its frame replay tool cannot recreate the capture's buffers on this card. Nothing of the game is in this repository.
 
 ## Not claimed
 
