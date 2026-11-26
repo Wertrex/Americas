@@ -131,6 +131,19 @@ single-layer, sampled 2D textures without their `n` largest mips. With 1 mip fro
 14.2 GB 100 s later. The frame rate did not clearly change, and two of the three runs with it ended early, so it is off by
 default.
 
+### Compute programs that did not translate (26 November 2026)
+
+About 840 of the 2,684 compute programs of the pipeline library, and 2 of the 29 programs of the FidelityFX upscaler DLL
+(the first one the title creates), never translated, so the title's `CreateComputePipelineState` calls for them failed
+(`0x80070057`, "no translated compute shader for FSPX kind-6 and kind-0") in every run. 839 of the 840 had the same
+cause: `llvm-mc` 21.1.8 rejects some words as invalid encodings (a VOP3P `v_dot4_i32_i8`, `0xcc16xxxx`, and one SMEM
+form), and a listing with undecodable words is refused by the translator. `tools/shader_disasm.py` now falls back to the
+pure-Python RDNA2 decoder when `llvm-mc` leaves invalid words and the decoder leaves fewer
+(`LEONIDA_NO_PY_DISASM_FALLBACK=1` turns it off). With it 2,683 of 2,684 library programs and all 29 upscaler programs
+translate and pass `spirv-val`. Rebuild the `shaders` stage to pick it up. Effect on the title is being measured; the
+Series S profile (`LEONIDA_DEVICE_TYPE=6`, 1080p internal, about 3 GB less video memory at the same point) used to end at
+61 s inside the upscaler DLL and now runs for several minutes.
+
 ## Not claimed
 
 No gameplay, no 3D world frame, no controllable character. Figures above are from one machine and a handful of runs

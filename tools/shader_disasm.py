@@ -97,6 +97,19 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
         fixed = with_vopc_dpp(code, mcpu, err, wave32)
         if fixed:
             return fixed
+    if bad:
+        # llvm-mc 21.1.8 rejects words the consoles' code uses (measured: VOP3P v_dot4_i32_i8, 0xcc16xxxx, and an SMEM
+        # form, in 839 of the 840 compute programs of the pipeline library that did not translate, and 2 of the 29 of the
+        # FidelityFX upscaler, whose first program the title creates). The Python decoder reads all of them. It is used
+        # for such a program only when it leaves fewer invalid words, so a program llvm-mc already decodes keeps its text.
+        # LEONIDA_NO_PY_DISASM_FALLBACK=1 turns it off.
+        if os.environ.get("LEONIDA_NO_PY_DISASM_FALLBACK") != "1":
+            try:
+                alt, alt_bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
+            except Exception:  # a decoder gap must not turn a listing llvm-mc produced into a failure
+                alt, alt_bad = "", bad
+            if alt.strip() and alt_bad < bad:
+                return alt, alt_bad, ""
     return asm, bad, err
 
 
