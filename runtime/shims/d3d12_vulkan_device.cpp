@@ -5831,8 +5831,12 @@ public:
     bool upload_staged_title(const rt::xg_xs::Texture& layout, const std::uint8_t* tiled,
                              std::vector<std::uint64_t>& columns, bool inspect, bool& nonzero) {
         std::lock_guard lock(device_.title_upload_mutex);
-        return device_.title_upload.write(device_, id(), binding_, layout, tiled, columns, inspect, nonzero);
+        return device_.title_upload.write(device_, id(), binding_, layout, tiled, columns, inspect, nonzero,
+                                          title_skip_mips_);
     }
+    // LEONIDA_TEXTURE_SKIP_MIPS: this image was made without the console texture's `n` largest mips.
+    void set_title_skip_mips(std::uint8_t n) { title_skip_mips_ = n; }
+    std::uint8_t title_skip_mips() const { return title_skip_mips_; }
     // Map and the destructor notify the registry for a slot-133 placement.
     void mark_title_texture() { title_texture_ = true; }
     void note_shader_view() const { shader_views_.fetch_add(1, std::memory_order_relaxed); }
@@ -7458,6 +7462,7 @@ private:
     std::uint64_t title_alias_ = 0;
     bool reserved_ = false;
     bool sparse_image_ = false;
+    std::uint8_t title_skip_mips_ = 0;  // see set_title_skip_mips
     bool placed_ = false;
     leonida::ResourceBinding binding_{};  // a texture's, as registered with the context
     std::unique_ptr<Resource> depth_conversion_;
@@ -10393,6 +10398,7 @@ struct TitleTexture {
     std::array<std::uint32_t, 14> desc{};   // the console resource words the layout was built from
     rt::xg_xs::Texture layout{};            // valid when layout_known
     bool layout_known = false;
+    std::uint8_t skip = 0;                  // owned: the image lacks the console texture's `skip` largest mips
     bool layout_guessed = false;            // a slot-133 texture's own description (Layout 0), no slot-70 view yet
     bool layout_from_xg = false;            // the title's XG computer of its shape (title_xg_layout)
     std::chrono::steady_clock::time_point view_checked{};  // refresh_title_texture's last look (a view's), throttled
@@ -12723,11 +12729,12 @@ private:
 
     // The image a layout fills: the same extent, mips, layers and element (texel or 4x4 block) size.
     static bool title_layout_fits(const rt::xg_xs::Texture& layout, const rt::xg_xs::ResourceDesc& d,
-                                  const Resource& r, const char*& why) {
+                                  const Resource& r, const char*& why, std::uint32_t skip = 0) {
         const D3D12_RESOURCE_DESC& desc = r.desc();
         const leonida::BlockFormat element = r.copy_element();
-        if (desc.Width != d.width || desc.Height != d.height || desc.DepthOrArraySize != d.depth_or_array ||
-            desc.MipLevels != layout.layout.mips || UINT(desc.Dimension) != d.dimension)
+        if (desc.Width != std::max<UINT64>(1, UINT64(d.width) >> skip) ||
+            desc.Height != std::max<UINT>(1, d.height >> skip) || desc.DepthOrArraySize != d.depth_or_array ||
+            desc.MipLevels != layout.layout.mips - skip || UINT(desc.Dimension) != d.dimension)
             return why = "texture of another extent, mips or layers at the address", false;
         if (element.bytes != layout.format.bytes || element.block != layout.format.side)
             return why = "image element differs from the console's", false;
@@ -12748,7 +12755,8 @@ private:
                           D3D12_CPU_DESCRIPTOR_HANDLE destination) {
         if (!address) return refuse_title_view("no address", d, address);
         const auto write = [&](const TitleTexture& t) {
-            const bool written = write_title_srv(*t.resource, srv, destination, d, address);
+            const bool written = write_title_srv(*t.resource, t.skip ? shift_skipped_srv(srv, t.skip) : srv, destination, d,
+                                                 address);
             if (written && !t.gpu_written && t.memory.pending()) ++title_stats_.pending_views;
             return written;
         };
@@ -12815,6 +12823,58 @@ private:
         return t.desc == words && (srv.Format == DXGI_FORMAT_UNKNOWN || has(srv.Format));
     }
 
+    // LEONIDA_TEXTURE_SKIP_MIPS=<n> (default 0, off): an image made for a slot-70 view of a large, sampled, single-layer 2D
+    // texture is made without its n largest mips, a quarter of the memory per mip. Shaders sample such a texture by
+    // normalized coordinates, so the hardware picks the same detail from a smaller image; levels below n are not
+    // uploaded and the views shift their mip range (shift_skipped_srv). LEONIDA_TEXTURE_SKIP_MIN=<pixels> (default 1024):
+    // only textures whose larger side is at least this are cut, and never below half of it.
+    static std::uint32_t title_skip_mips_for(const rt::xg_xs::ResourceDesc& d, std::uint32_t mips) {
+        namespace xg = rt::xg_xs;
+        static const std::uint32_t want = [] {
+            const char* v = std::getenv("LEONIDA_TEXTURE_SKIP_MIPS");
+            return v ? std::uint32_t(std::min<unsigned long>(std::strtoul(v, nullptr, 10), 4)) : 0u;
+        }();
+        static const std::uint32_t min_side = [] {
+            const char* v = std::getenv("LEONIDA_TEXTURE_SKIP_MIN");
+            const unsigned long n = v ? std::strtoul(v, nullptr, 10) : 1024ul;
+            return std::uint32_t(std::max<unsigned long>(n, 64));
+        }();
+        if (!want || d.dimension != xg::kTexture2D || d.depth_or_array != 1 || mips < 3) return 0;
+        const std::uint32_t side = std::max<std::uint32_t>(d.width, d.height);
+        if (side < min_side) return 0;
+        std::uint32_t skip = 0;
+        while (skip < want && skip + 2 < mips && (side >> (skip + 1)) >= min_side / 2) ++skip;
+        return skip;
+    }
+
+    void note_skipped_title_texture(const rt::xg_xs::ResourceDesc& d, std::uint32_t skip) {
+        static std::atomic<std::uint64_t> count{0}, saved_kib{0};
+        const std::uint64_t texels = std::uint64_t(d.width) * d.height;
+        // About 1 byte a texel for the block formats of the title's art, a third more for the mip chain.
+        saved_kib.fetch_add((texels - (texels >> (2 * skip))) * 4 / 3 / 1024, std::memory_order_relaxed);
+        const std::uint64_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 4 || !(n & (n - 1)) || !(n % 1000))
+            std::fprintf(stderr, "[rt] d3d12: texture mip skip: %llu images made without their top %u mip(s), about %llu MiB "
+                                 "not allocated (latest %ux%u)\n",
+                         static_cast<unsigned long long>(n), skip,
+                         static_cast<unsigned long long>(saved_kib.load(std::memory_order_relaxed) >> 10), d.width, d.height);
+    }
+
+    // The view the title's T# describes, for an image that lacks its `skip` largest mips: its mip range shifts down.
+    static D3D12_SHADER_RESOURCE_VIEW_DESC shift_skipped_srv(D3D12_SHADER_RESOURCE_VIEW_DESC srv, std::uint32_t skip) {
+        const auto shift = [skip](UINT& most, UINT& count) {
+            const UINT first = most, last = count == UINT_MAX ? UINT_MAX : first + count;  // [first, last)
+            const UINT begin = first > skip ? first - skip : 0;
+            most = begin;
+            if (count != UINT_MAX) count = last > skip && last - skip > begin ? last - skip - begin : 1;
+        };
+        if (srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
+            shift(srv.Texture2D.MostDetailedMip, srv.Texture2D.MipLevels);
+        else if (srv.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY)
+            shift(srv.Texture2DArray.MostDetailedMip, srv.Texture2DArray.MipLevels);
+        return srv;
+    }
+
     TitleTexture* make_title_texture(const rt::xg_xs::ResourceDesc& d, const std::array<std::uint32_t, 14>& words,
                                      const D3D12_SHADER_RESOURCE_VIEW_DESC& srv, std::uint64_t address,
                                      std::vector<DXGI_FORMAT> formats) {
@@ -12846,12 +12906,13 @@ private:
                 return refuse_title_view("view format of another element size", d, address), nullptr;
             add(srv.Format);
         }
+        const std::uint32_t skip = title_skip_mips_for(d, entry->layout.layout.mips);
         D3D12_RESOURCE_DESC pc{};
         pc.Dimension = D3D12_RESOURCE_DIMENSION(d.dimension);
-        pc.Width = d.width;
-        pc.Height = d.height;
+        pc.Width = std::max<UINT64>(1, UINT64(d.width) >> skip);
+        pc.Height = std::max<UINT>(1, d.height >> skip);
         pc.DepthOrArraySize = d.depth_or_array;
-        pc.MipLevels = UINT16(entry->layout.layout.mips);
+        pc.MipLevels = UINT16(entry->layout.layout.mips - skip);
         pc.Format = formats.front();
         pc.SampleDesc = {1, 0};
         pc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -12878,10 +12939,13 @@ private:
             log_once("an image for a slot-70 texture view could not be made; HRESULT", int(hr));
             return refuse_title_view("image not created", d, address), nullptr;
         }
-        if (!title_layout_fits(entry->layout, d, *r, why)) {
+        if (!title_layout_fits(entry->layout, d, *r, why, skip)) {
             r->Release();
             return refuse_title_view(why, d, address), nullptr;
         }
+        r->set_title_skip_mips(std::uint8_t(skip));
+        entry->skip = std::uint8_t(skip);
+        if (skip) note_skipped_title_texture(d, skip);
         r->place_at_title_address(reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)));
         entry->address = address;
         entry->desc = words;
@@ -13000,8 +13064,9 @@ private:
     std::uint64_t fill_title_texture(TitleTexture& t, bool staged) {
         const rt::xg_xs::Texture& layout = t.layout;
         const std::uint32_t mips = layout.layout.mips, slices = layout.array;
+        const std::uint32_t skip = t.skip, image_mips = mips - skip;  // the image's levels
         if (!staged && !t.unbound_bytes && !t.resource->staged_title())
-            for (UINT sub = 0; sub < mips * slices; ++sub)
+            for (UINT sub = 0; sub < image_mips * slices; ++sub)
                 if (!t.resource->host_copy_now(sub)) {
                     t.stale = true;
                     return 0;
@@ -13046,7 +13111,7 @@ private:
             if (!ok) log_once("staged title texture upload failed, format", int(t.resource->format()));
         } else {
             for (std::uint32_t slice = 0; slice < slices && ok; ++slice) {
-                for (std::uint32_t level = 0; level < mips && ok; ++level) {
+                for (std::uint32_t level = skip; level < mips && ok; ++level) {
                     const auto& mip = layout.layout.plane[0].mips[level];
                     const std::uint32_t row_pitch = mip.width_elements * layout.format.bytes;
                     const std::uint32_t slice_pitch = row_pitch * mip.height_elements;
@@ -13056,8 +13121,8 @@ private:
                     if (trace_pool && !nonzero)
                         nonzero = std::any_of(title_linear_.begin(), title_linear_.end(), [](auto byte) { return byte != 0; });
                     const HRESULT hr =
-                        t.resource->upload_title_subresource(level + slice * mips, title_linear_.data(), row_pitch,
-                                                             slice_pitch, staged);
+                        t.resource->upload_title_subresource((level - skip) + slice * image_mips, title_linear_.data(),
+                                                             row_pitch, slice_pitch, staged);
                     if (FAILED(hr)) {
                         log_once("a title texture's subresource could not be filled; HRESULT", int(hr));
                         ok = false;

@@ -36,12 +36,16 @@ public:
     }
 
     template<class Device>
+    // `skip`: the image holds the console texture without its `skip` largest mips (LEONIDA_TEXTURE_SKIP_MIPS): console
+    // level L is image level L - skip, and the levels below `skip` are not uploaded.
     bool write(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
                const xg_xs::Texture& layout, const std::uint8_t* tiled, std::vector<std::uint64_t>& columns,
-               bool inspect, bool& nonzero) {
+               bool inspect, bool& nonzero, unsigned skip = 0) {
         const auto block = leonida::copy_block_format(image, VK_IMAGE_ASPECT_COLOR_BIT);
-        const auto mips = layout.layout.mips;
+        const auto console_mips = layout.layout.mips;
         const auto layers = layout.array;
+        if (skip >= console_mips) return false;
+        const auto mips = console_mips - skip;  // the image's levels
         if (!block.bytes || block.bytes != layout.format.bytes || !mips || mips > image.mip_levels ||
             !layers || layers > image.array_layers) return false;
 
@@ -49,7 +53,7 @@ public:
         VkDeviceSize bytes = 0;
         for (unsigned layer = 0; layer < layers; ++layer) {
             for (unsigned level = 0; level < mips; ++level) {
-                const auto& mip = layout.layout.plane[0].mips[level];
+                const auto& mip = layout.layout.plane[0].mips[level + skip];
                 VkBufferImageCopy copy{};
                 copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
                 copy.imageExtent = {std::max(1u, image.width >> level), std::max(1u, image.height >> level),
@@ -71,7 +75,7 @@ public:
         if (!prepare(d, slot, bytes)) return false;
         next_ = (next_ + 1) % kSlots;
         for (const auto& copy : regions_) {
-            const auto level = copy.imageSubresource.mipLevel;
+            const auto level = copy.imageSubresource.mipLevel + skip;  // the console's level
             const auto& mip = layout.layout.plane[0].mips[level];
             const auto row = mip.width_elements * block.bytes, slice = row * mip.height_elements;
             auto* dst = slot.mapped + copy.bufferOffset;
