@@ -6,7 +6,9 @@ or shaders**, and it does not explain how to obtain them. You need your own copy
 [README.md](README.md) for the build and [AGENTS.md](AGENTS.md) for the repository rules.
 
 **Status: early. Not playable.** The game starts, passes the story load and plays the opening of the story (the studio
-cards and the first title text) at about 1 frame/s. It does not reach the open world yet.
+cards and the first title text) at about 1 frame/s, with a black background behind the text and no sound. It does not
+reach the open world yet. The limits measured so far are video memory (about 14 GB wanted on a 12 GB card), the cost of
+every submission (about 18 ms, about 56 submissions a frame) and the early exits described below.
 
 ## What is different from upstream
 
@@ -40,6 +42,8 @@ down; see upstream issue #1537.
 
 ## Diagnosis of the world-start failure (25 November 2026)
 
+*Superseded: the GPU-loss and early-exit causes were found later and are described in the next sections. Kept for the record.*
+
 Measured with `LEONIDA_DEVICE_FAULT=1` and `--trace`. These are observations, not a fix.
 
 - **The game waits for input.** After the first-run screens it sits on its loading slideshow until the pad gets an A
@@ -56,24 +60,6 @@ Measured with `LEONIDA_DEVICE_FAULT=1` and `--trace`. These are observations, no
   limitation of the project.
 - **A misleading log line fixed here.** `the releaser ... gate Signal ... for 18446744073709551615 ms` was an unsigned
   subtraction wrapping by one tick, not a stall.
-
-## Tuning pass (25 November 2026, evening)
-
-Settings only, no code change, same machine. Story load went from 4-8 frames/s to about 10 frames/s, and the title
-now lives longer before the GPU is lost (about 117 s before, up to about 248 s of wall time in the best run,
-including time idling on the slideshow).
-
-| Variable | Value used |
-|---|---|
-| `LEONIDA_ASYNC_PIPELINES` / `LEONIDA_PIPELINE_THREADS` | `1` / `12` (replay-phase cost per submission about 1,300 ms down to under 1 ms) |
-| `LEONIDA_SHADOW_ALIAS_MS`, `LEONIDA_REFRESH_PER_FRAME` | `250`, `2` (a GPU read can be a frame behind: wrong pixels) |
-| `LEONIDA_TITLE_FILL_ASYNC`, `LEONIDA_GEOMETRY_ASYNC` | `1`, `1` (same trade) |
-
-The world start still fails: the GPU is lost about 40 s into the load, with an invalid read at `heap_base + VA`
-where the VA is free memory (`MEM_FREE`), i.e. a pointer the title does not own. Skipping individual compute
-programs only changes which one faults, and skipping every library compute program does not prevent it, so it is not
-one shader. The leading suspect is data a skipped or mistranslated pass should have produced; this is not confirmed.
-A small diagnostic was added: the device-fault report now queries the faulting address minus the arena base.
 
 ## GPU-loss investigation (26 November 2026)
 
@@ -101,6 +87,49 @@ Settings that reach the story without losing the GPU (run for 300 s and more): a
 `LEONIDA_SKIP_COMPUTE` for eight compute programs. Do **not** set `LEONIDA_REFRESH_PER_FRAME`. Rate in that scene: about
 1 frame/s, with about 35 submissions per frame costing about 30 ms each (console heaps 9 ms, textures 15 ms, shadows
 5 ms). The skipped compute programs are a workaround for earlier faults and are probably not all needed any more.
+
+## Where the time and the memory go (26 November 2026, night)
+
+Measured on one machine (Windows 11, RTX 5070 with 12 GB, Ryzen 9 9950X3D) during the story opening, which runs at about
+1 frame/s:
+
+- **Video memory is oversubscribed.** `LEONIDA_VRAM_ACCOUNT=1` counts every device allocation: the process reserves
+  about 14 to 15.7 GB on a 12 GB card during the story load, about 9.5 to 10.5 GB of it individual title textures
+  (some 2,200 to 2,700 allocations). Windows then keeps about 3 GB in shared system memory, which the GPU reads over PCIe,
+  and some allocations fail (`VK_ERROR_OUT_OF_DEVICE_MEMORY`). The demand grows as the title streams more textures.
+- **The GPU queue is idle about half of the time** (`LEONIDA_GPU_LATENCY=1`), with queue operations held about 1 s on
+  average. A CPU sampler (thread program counters and stacks, symbolised from the PDB) showed one thread at 100% inside
+  the NVIDIA shader compiler and the rest waiting.
+- **The title thread spent about 72% of its time in `CopyPageMappingsBatchX`**, mapping one 64 KiB page per unmap and
+  `MapViewOfFile3`. Runs of consecutive physical pages are now mapped as one view (`LEONIDA_XMEM_BULK_MAP=0` restores the
+  old path). Frame rate went from about 0.8 to about 1.0.
+- **Pipeline cache.** The session cache was discarded at exit (474 MB over a 256 MB limit) and a title that is busy never
+  reaches the exit save. `LEONIDA_PIPELINE_CACHE_BYTES` and `LEONIDA_PIPELINE_CACHE_SAVE_S` keep it; later runs compile less.
+
+### Early exits of the title
+
+Several runs ended with an access violation inside the title. In the clearest case the runtime's own report showed the
+page unmapped 1,219 ms before the title read it: the console applies `CopyPageMappingsBatchX` in GPU-queue order and this
+runtime applies it when it is called (the same open gap as the upstream notes describe). Calls that unmap pages now leave
+them mapped (`LEONIDA_SLOT31_KEEP_MAPPED=0` restores the unmap). One run ran past 270 s with it; longer runs are not yet
+confirmed. Two DirectStorage requests (BC7 impostor atlases with no predictor in the local history) used to fail every
+run; they are now written as zero blocks and succeed (`LEONIDA_DSTORAGE_LENIENT=0` restores the error).
+
+### Settings
+
+Asynchronous pipeline builds (`LEONIDA_ASYNC_PIPELINES=1`, `LEONIDA_PIPELINE_THREADS=12`), deferred texture and geometry
+fills, `LEONIDA_TITLE_TEXTURE_PERIOD_MS=250`, `LEONIDA_SHADOW_ALIAS_MS=250`. Do not set `LEONIDA_REFRESH_PER_FRAME`
+(stale descriptors, see above). `LEONIDA_MEMORY_PRIORITY=1` (Vulkan memory priorities) is available but off: with it the
+title ended within two minutes in three runs out of three. `LEONIDA_TITLE_MEMORY_MB` and `LEONIDA_SLOT133_IMPORT=0` did not
+change the memory or the rate.
+
+### Optional mip skip
+
+`LEONIDA_TEXTURE_SKIP_MIPS=<n>` with `LEONIDA_TEXTURE_SKIP_MIN=<pixels>` makes the images the layer creates for large,
+single-layer, sampled 2D textures without their `n` largest mips. With 1 mip from 1,024 pixels the reserved memory was
+11.6 GB instead of 15.4 GB at the same point of the load; with 2 mips from 512 pixels it started at 10.6 GB and reached
+14.2 GB 100 s later. The frame rate did not clearly change, and two of the three runs with it ended early, so it is off by
+default.
 
 ## Not claimed
 
