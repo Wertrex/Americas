@@ -2039,7 +2039,17 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
     // (title_gpu_views::to_cpu); that view gets the same pages, or it would stay reserved and never readable.
     const uintptr_t cpu_to = leonida::title_gpu_views::to_cpu(to, pages * kPhysicalPageSize);
     const Window* const cpu_window = cpu_to != to ? find_window(cpu_to, pages * kPhysicalPageSize) : nullptr;
+    // LEONIDA_SLOT31_KEEP_MAPPED (default on, 0 turns it off): a CopyPageMappingsBatchX that unmaps pages leaves them mapped.
+    // The console applies the call in the order of the GPU queue; here it ran when it was made, and a page the title
+    // still read a moment later (the CPU side runs ahead of the queue) was a reserved placeholder: an access violation,
+    // measured as "unmap ... 1219 ms ago" before the read fault in three of three runs that ended that way. A page left
+    // mapped is only memory the title no longer names; a later map of the address replaces it.
+    static const bool keep_mapped = [] {
+        char v[2]{};
+        return GetEnvironmentVariableA("LEONIDA_SLOT31_KEEP_MAPPED", v, sizeof v) != 1 || v[0] != '0';
+    }();
     if (!source) {
+        if (keep_mapped) return true;
         for (uint64_t i = 0; i < pages; ++i) {
             if (!unmap_page(to + i * kPhysicalPageSize)) return false;
             if (cpu_window && !unmap_page(cpu_to + i * kPhysicalPageSize)) return false;
@@ -2065,6 +2075,7 @@ bool copy_page_mappings(void* destination, const void* source, uint64_t pages, b
     }();
     for (uint64_t i = 0; i < pages;) {
         const uint64_t page = found[static_cast<size_t>(i)];
+        if (!page && keep_mapped) { ++i; continue; }  // a source page that is not mapped: nothing to copy, nothing to unmap
         const uint64_t run = bulk ? map_run_length(found, i, kMaxViewPages) : 1;
         if (run > 1) {
             if (!map_pages(to + i * kPhysicalPageSize, page, run, protect, MapOwner::slot31)) return false;
